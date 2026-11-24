@@ -1,0 +1,15 @@
+extension:
+  name: privacy
+  description: "Privacy engineering primitives - differential privacy mechanisms, PII/PHI masking, CN-compliant masking (GB/T 37964), k-anonymity, MIMIC-style date shifting, secrets redaction, reversible text redaction, FPE FF3/FF3-1"
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;windows_amd64_rtools;windows_amd64_mingw"
+  requires_toolchains: "rust"
+  maintainers:
+    - alitrack
+
+repo:
+  github: alitrack/duckdb-privacy
+  ref: refs/tags/v0.1.0

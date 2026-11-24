@@ -1,0 +1,22 @@
+[package]
+name = "privacy"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB extension: privacy engineering primitives - differential privacy, PII/PHI masking, k-anonymity, CN-compliant masking (GB/T 37964), date shifting, secrets redaction, FPE FF3/FF3-1"
+license = "MIT"
+repository = "https://github.com/alitrack/duckdb-privacy"
+
+[lib]
+name = "privacy"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+quack-rs = "0.14"
+libduckdb-sys = "1.10504"
+regex = "=1.13.1"
+aes = "0.8"
+generic-array = "0.14"
