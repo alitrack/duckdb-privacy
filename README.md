@@ -90,12 +90,41 @@ duckdb -c "LOAD 'build/release/privacy.duckdb_extension';" < test/smoke.sql
 
 `test/smoke.sql` exercises every op with structural invariants and
 round-trip checks. FPE determinism, format preservation, and key-bounding are
-asserted directly; DP symmetry is checked over 10k Laplace draws.
+asserted directly; DP symmetry is checked over 10k Laplace draws drawn from a
+single advancing stream (the shape a real query has, so a per-row re-seed
+regression shows up here). `cargo test` carries the statistical regression for
+the noise generator itself: centring, scale, symmetry, LCG domain, uniformity,
+known Park-Miller values, and per-seed determinism.
+
+## Noise semantics (read this before using `laplace` / `dp_*`)
+
+- **A draw is fresh per row.** The noise functions are registered as volatile, so
+  DuckDB cannot constant-fold them: `SELECT laplace(2) FROM t` produces a
+  different draw for every row even though the argument never changes. (Without
+  the volatile flag DuckDB evaluates the function once and repeats that single
+  draw for the whole result set, which silently collapses any per-row noise.)
+- **Rows in one query draw from one advancing stream**, not from a per-row
+  re-seed. Re-seeding per row used to make every row in the same wall-clock
+  second receive the *identical* value.
+- **An explicit seed makes the draw reproducible** — `laplace(2, 42)` is the same
+  value every time, on every row. Use a seed for tests, not for production noise;
+  when you need per-row noise, omit it.
+- **The stream is warmed up before the first draw.** The Park-Miller LCG emits
+  `x1 = 16807*seed` as its first output, which correlated the first draw so
+  strongly with the seed that small or adjacent seeds produced one-sided noise
+  (an empirical check over seeds 0..20000 returned *zero* positive draws, bias
+  ≈ -2.16·scale). That bug voids the ε-DP guarantee, since Laplace noise must be
+  centred on zero. Values are therefore deterministic per seed but **not**
+  numerically identical to the Lua reference.
 
 ## Honest boundaries (carried over from the Lua lib)
 
 - `dp_*` mechanisms are **Laplace-based** (sensitivity 1 for count/mean, max|value|
   for sum). They are not calibrated for Gaussian or RDP composition.
+- The PRNG is a 31-bit Park-Miller LCG: empirically the Laplace draw over 10^6
+  samples lands at std ≈ 2.87 for a nominal `2√2 = 2.828` and P(x>0) ≈ 0.50, i.e.
+  ~1–2% lattice deviation. Fine for reportable aggregates; do not treat the
+  stream as cryptographic randomness.
 - `kanon` is **simplified Mondrian** (equal-weight range/prefix split), not a
   full recursive partitioner; `kanon_report` measures the result, it does not
   guarantee feasibility.

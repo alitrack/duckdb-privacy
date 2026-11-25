@@ -6,21 +6,36 @@
 //! the standalone Rust product form: `install privacy;` and go — no luajit
 //! runtime dependency, native u128 FPE, `regex`-crate redaction.
 //!
-//! API surface (all return VARCHAR):
-//!   privacy(json_args)     — master dispatcher, JSON args with "op" field,
-//!                            output byte-compatible with the Lua lib
-//!   plus named shortcuts for the hot paths (dp_count, dp_sum, laplace,
-//!   mask, mask_cn, dateshift, redact_secrets, fpe_encode, fpe_decode).
+//! API surface (VARCHAR unless noted):
+//!   privacy(json_args)  — master dispatcher, JSON args with an "op" field.
+//!                         Unknown op / bad JSON → NULL, not empty string:
+//!                         a typo must not look like a legitimately empty mask.
+//!   named shortcuts     — one overload per arity, so the documented call forms
+//!                         work directly:
+//!                           dp_count(true_count[, epsilon])
+//!                           dp_sum(true_sum[, epsilon])
+//!                           laplace(scale[, seed])
+//!                           mask(value[, kind])
+//!                           mask_cn(value[, kind[, mode]])
+//!                           dateshift(value[, days])
+//!                           dateoffset(date, delta_days)
+//!                           redact_text(value) / redact_secrets(value)
+//!                           fpe_encode(value, key, tweak)
+//!                           fpe_decode(value, key, tweak)
+//!                           dp_alloc(scope, key, epsilon, budget)
+//!                           dp_budget(scope)
 //!
 //! JSON args keep the Lua table field names verbatim (true_count, epsilon,
-//! sensitivity, v, kind, mode, salt, key, days, ...), so existing luajit
-//! call sites convert by wrapping the table as JSON.
+//! sensitivity, v, kind, mode, salt, key, days, ...), so existing luajit call
+//! sites convert by wrapping the table as JSON.
 
 pub mod dp;
 pub mod fpe;
 pub mod json;
 pub mod kanon;
+pub mod ledger;
 pub mod mask;
+pub mod pii;
 pub mod redact;
 pub mod rng;
 
@@ -34,27 +49,75 @@ use libduckdb_sys::{
     duckdb_extension_info, duckdb_function_info, duckdb_vector,
 };
 
-/// Master dispatcher: privacy(json) → VARCHAR
-/// Parses the JSON args (object with "op" or legacy op-less = mask) and
-/// routes to the matching op. Unknown op / bad JSON → '' (empty, same
-/// contract as the Lua `run()` falling through).
-fn dispatch(raw: &str) -> String {
+// ── helpers ────────────────────────────────────────────────────────
+
+fn rows(input: duckdb_data_chunk) -> usize {
+    usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0)
+}
+
+fn objs(pairs: Vec<(&str, json::Value)>) -> json::Value {
+    json::obj(pairs)
+}
+
+fn vs(s: &str) -> json::Value {
+    json::Value::Str(s.to_string())
+}
+
+fn vn(x: f64) -> json::Value {
+    json::Value::Num(x)
+}
+
+/// Read column `col` of the chunk as an owned string; None means SQL NULL.
+fn col_str(input: duckdb_data_chunk, col: usize, i: usize) -> Option<String> {
+    let r = unsafe { VectorReader::new(input, col) };
+    if !unsafe { r.is_valid(i) } {
+        return None;
+    }
+    Some(unsafe { r.read_str(i) }.to_string())
+}
+
+/// Pull the `value` field out of an FPE JSON envelope. The shortcuts return the
+/// ciphertext itself so `fpe_decode(fpe_encode(x, k, t), k, t)` composes.
+fn fpe_value(out: &str) -> String {
+    match json::decode(out) {
+        Ok(v) => match v.get("value") {
+            Some(json::Value::Str(s)) => s.clone(),
+            Some(other) => json::to_str_lossy(other),
+            None => out.to_string(),
+        },
+        Err(_) => out.to_string(),
+    }
+}
+
+/// mask_cn uses its own kind vocabulary; map the common spellings onto it so
+/// `phone` behaves like `mobile` instead of falling through to generic star.
+fn cn_kind(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "phone" | "mobile" | "cell" | "tel" | "手机" | "手机号" => "mobile".into(),
+        "id" | "idcard" | "id_card" | "身份证" => "idcard".into(),
+        "card" | "bankcard" | "银行卡" | "信用卡" => "bankcard".into(),
+        "mail" | "邮箱" => "email".into(),
+        "姓名" | "person" => "name".into(),
+        other => other.to_string(),
+    }
+}
+
+// ── master dispatcher ──────────────────────────────────────────────
+
+fn dispatch(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return None;
     }
-    let v = match json::decode(trimmed) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
+    let v = json::decode(trimmed).ok()?;
     if !v.is_obj() {
-        return String::new();
+        return None;
     }
     let op = v
         .get("op")
         .map(json::to_str_lossy)
         .unwrap_or_else(|| "mask".to_string());
-    match op.as_str() {
+    let out = match op.as_str() {
         "dp_count" => dp::dp_count(&v),
         "dp_sum" => dp::dp_sum(&v),
         "dp_mean" => dp::dp_mean(&v),
@@ -62,7 +125,17 @@ fn dispatch(raw: &str) -> String {
         "dp_compose" => dp::dp_compose(&v),
         "dp_alloc" => dp::dp_alloc(&v),
         "dp_budget" => dp::dp_budget(&v),
-        "mask" => mask::mask(&v),
+        "mask" => {
+            // With a `kind` field the caller means PII masking (phone/email/
+            // name/id...), which is a different rule set from the Lua-compatible
+            // star/hash modes. Route on the presence of `kind`.
+            if v.get("kind").is_some() {
+                pii::mask_kind(&v)
+            } else {
+                mask::mask(&v)
+            }
+        }
+        "mask_kind" => pii::mask_kind(&v),
         "mask_cn" => mask::mask_cn(&v),
         "dateshift" => mask::dateshift(&v),
         "dateoffset" => mask::dateoffset(&v),
@@ -74,133 +147,108 @@ fn dispatch(raw: &str) -> String {
         "fpe_encode" => fpe::fpe_op(&v, true),
         "fpe_decode" => fpe::fpe_op(&v, false),
         "fpe_luhn" => fpe::fpe_luhn(&v),
-        _ => String::new(),
-    }
+        _ => return None,
+    };
+    Some(out)
 }
 
-// ── scalar function callbacks ──────────────────────────────────────
+// ── scalar callbacks ───────────────────────────────────────────────
 
-/// One VARCHAR in → dispatch(json) out.
-unsafe extern "C" fn privacy_dispatch_fn(
+/// privacy(json) — NULL-preserving on both the input and the unknown-op path.
+unsafe extern "C" fn fn_privacy(
     _info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rin = unsafe { VectorReader::new(input, 0) }; // VARCHAR json
+    let n = rows(input);
     let mut out = unsafe { VectorWriter::new(output) };
     for i in 0..n {
-        if !unsafe { rin.is_valid(i) } {
-            unsafe { out.set_null(i) };
-            continue;
+        match col_str(input, 0, i).as_deref().and_then(dispatch) {
+            Some(res) => unsafe { out.write_str(i, &res) },
+            None => unsafe { out.set_null(i) },
         }
-        let res = dispatch(unsafe { rin.read_str(i) });
-        unsafe { out.write_str(i, &res) };
     }
 }
 
-
-fn vchar_op(input: duckdb_data_chunk, output: duckdb_vector, f: fn(&json::Value) -> String) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rin = unsafe { VectorReader::new(input, 0) };
+/// One string in, one string out, wrapped as `{"v": value}`.
+fn unary(input: duckdb_data_chunk, output: duckdb_vector, f: fn(&json::Value) -> String) {
+    let n = rows(input);
     let mut out = unsafe { VectorWriter::new(output) };
     for i in 0..n {
-        if !unsafe { rin.is_valid(i) } {
-            unsafe { out.set_null(i) };
-            continue;
+        match col_str(input, 0, i) {
+            Some(raw) => {
+                let res = f(&objs(vec![("v", vs(&raw))]));
+                unsafe { out.write_str(i, &res) }
+            }
+            None => unsafe { out.set_null(i) },
         }
-        let raw = unsafe { rin.read_str(i) };
-        let res = f(&json::obj(vec![("v", json::Value::Str(raw.to_string()))]));
-        unsafe { out.write_str(i, &res) };
     }
 }
 
-fn vchar_op_op(input: duckdb_data_chunk, output: duckdb_vector, f: fn(&json::Value) -> String) {
-    // ops that read other fields beyond "v" (dateshift: days/salt/key)
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rin = unsafe { VectorReader::new(input, 0) };
-    let mut out = unsafe { VectorWriter::new(output) };
-    for i in 0..n {
-        if !unsafe { rin.is_valid(i) } {
-            unsafe { out.set_null(i) };
-            continue;
-        }
-        let raw = unsafe { rin.read_str(i) };
-        let res = f(&json::obj(vec![("v", json::Value::Str(raw.to_string()))]));
-        unsafe { out.write_str(i, &res) };
-    }
-}
-
-unsafe extern "C" fn fn_mask(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    vchar_op(input, output, mask::mask);
-}
-unsafe extern "C" fn fn_mask_cn(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    vchar_op(input, output, mask::mask_cn);
-}
-unsafe extern "C" fn fn_dateshift(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    vchar_op_op(input, output, mask::dateshift);
-}
-unsafe extern "C" fn fn_redact_secrets(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    vchar_op(input, output, redact::redact_secrets);
-}
-unsafe extern "C" fn fn_fpe_encode(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rin = unsafe { VectorReader::new(input, 0) };
-    let mut out = unsafe { VectorWriter::new(output) };
-    for i in 0..n {
-        if !unsafe { rin.is_valid(i) } {
-            unsafe { out.set_null(i) };
-            continue;
-        }
-        let raw = unsafe { rin.read_str(i) };
-        // vchar with op hint
-        let v = json::obj(vec![
-            ("v", json::Value::Str(raw.to_string())),
-            ("op", json::Value::Str("fpe_encode".to_string())),
-        ]);
-        unsafe { out.write_str(i, &fpe::fpe_op(&v, true)) };
-    }
-}
-unsafe extern "C" fn fn_fpe_decode(_info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rin = unsafe { VectorReader::new(input, 0) };
-    let mut out = unsafe { VectorWriter::new(output) };
-    for i in 0..n {
-        if !unsafe { rin.is_valid(i) } {
-            unsafe { out.set_null(i) };
-            continue;
-        }
-        let raw = unsafe { rin.read_str(i) };
-        let v = json::obj(vec![
-            ("v", json::Value::Str(raw.to_string())),
-            ("op", json::Value::Str("fpe_decode".to_string())),
-        ]);
-        unsafe { out.write_str(i, &fpe::fpe_op(&v, false)) };
-    }
-}
-
-// Two-arg shortcut: dp_count(true_count, epsilon)
-unsafe extern "C" fn fn_dp_count2(
-    _info: duckdb_function_info,
+unsafe extern "C" fn fn_dp_count1(
+    _i: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rc = unsafe { VectorReader::new(input, 0) }; // BIGINT true_count
-    let re = unsafe { VectorReader::new(input, 1) }; // DOUBLE epsilon
+    let n = rows(input);
+    let rc = unsafe { VectorReader::new(input, 0) };
     let mut out = unsafe { VectorWriter::new(output) };
+    // One RNG per chunk, advanced once per row. Re-seeding inside the loop made
+    // every row land on the same wall-clock seed, so a whole table received the
+    // *identical* noise draw — no independence, no protection.
+    let mut rng = dp::stream_rng(None);
     for i in 0..n {
         if !unsafe { rc.is_valid(i) } {
             unsafe { out.set_null(i) };
             continue;
         }
-        let count = unsafe { rc.read_i64(i) } as f64;
-        let eps = unsafe { re.is_valid(i) }.then(|| unsafe { re.read_f64(i) }).unwrap_or(1.0);
-        let v = json::obj(vec![
-            ("true_count", json::Value::Num(count)),
-            ("epsilon", json::Value::Num(eps)),
-        ]);
-        unsafe { out.write_str(i, &dp::dp_count(&v)) };
+        let c = unsafe { rc.read_i64(i) } as f64;
+        let res = dp::dp_count_draw(&mut rng, c, 1.0, 1.0);
+        unsafe { out.write_str(i, &res) }
+    }
+}
+
+unsafe extern "C" fn fn_dp_count2(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rc = unsafe { VectorReader::new(input, 0) };
+    let re = unsafe { VectorReader::new(input, 1) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    let mut rng = dp::stream_rng(None);
+    for i in 0..n {
+        if !unsafe { rc.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let c = unsafe { rc.read_i64(i) } as f64;
+        let eps = unsafe { re.is_valid(i) }
+            .then(|| unsafe { re.read_f64(i) })
+            .unwrap_or(1.0);
+        let res = dp::dp_count_draw(&mut rng, c, 1.0, eps);
+        unsafe { out.write_str(i, &res) }
+    }
+}
+
+unsafe extern "C" fn fn_dp_sum1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rs = unsafe { VectorReader::new(input, 0) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    let mut rng = dp::stream_rng(None);
+    for i in 0..n {
+        if !unsafe { rs.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let s = unsafe { rs.read_f64(i) };
+        let res = dp::dp_sum_draw(&mut rng, s, 100.0, 1.0);
+        unsafe { out.write_str(i, &res) }
     }
 }
 
@@ -209,93 +257,509 @@ unsafe extern "C" fn fn_dp_sum2(
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rs = unsafe { VectorReader::new(input, 0) }; // DOUBLE true_sum
-    let re = unsafe { VectorReader::new(input, 1) }; // DOUBLE epsilon
+    let n = rows(input);
+    let rs = unsafe { VectorReader::new(input, 0) };
+    let re = unsafe { VectorReader::new(input, 1) };
     let mut out = unsafe { VectorWriter::new(output) };
+    let mut rng = dp::stream_rng(None);
     for i in 0..n {
         if !unsafe { rs.is_valid(i) } {
             unsafe { out.set_null(i) };
             continue;
         }
-        let sum = unsafe { rs.read_f64(i) };
-        let eps = unsafe { re.is_valid(i) }.then(|| unsafe { re.read_f64(i) }).unwrap_or(1.0);
-        let v = json::obj(vec![
-            ("true_sum", json::Value::Num(sum)),
-            ("epsilon", json::Value::Num(eps)),
-        ]);
-        unsafe { out.write_str(i, &dp::dp_sum(&v)) };
+        let s = unsafe { rs.read_f64(i) };
+        let eps = unsafe { re.is_valid(i) }
+            .then(|| unsafe { re.read_f64(i) })
+            .unwrap_or(1.0);
+        let res = dp::dp_sum_draw(&mut rng, s, 100.0, eps);
+        unsafe { out.write_str(i, &res) }
+    }
+}
+
+unsafe extern "C" fn fn_laplace1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rs = unsafe { VectorReader::new(input, 0) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    let mut rng = dp::stream_rng(None);
+    for i in 0..n {
+        if !unsafe { rs.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let b = unsafe { rs.read_f64(i) };
+        let res = dp::laplace_draw(&mut rng, b);
+        unsafe { out.write_str(i, &res) }
     }
 }
 
 unsafe extern "C" fn fn_laplace2(
-    _info: duckdb_function_info,
+    _i: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
-    let rs = unsafe { VectorReader::new(input, 0) }; // DOUBLE scale
+    let n = rows(input);
+    let rs = unsafe { VectorReader::new(input, 0) };
+    let re = unsafe { VectorReader::new(input, 1) };
     let mut out = unsafe { VectorWriter::new(output) };
     for i in 0..n {
         if !unsafe { rs.is_valid(i) } {
             unsafe { out.set_null(i) };
             continue;
         }
-        let scale = unsafe { rs.read_f64(i) };
-        let v = json::obj(vec![("b", json::Value::Num(scale))]);
-        unsafe { out.write_str(i, &dp::laplace(&v)) };
+        let b = unsafe { rs.read_f64(i) };
+        // A per-row seed is honoured (same seed → same draw), but the stream is
+        // warmed first: Park-Miller leaks the seed into its first output
+        // (x1 = 16807*seed), which biased the noise toward one sign for small
+        // or near-equal seeds.
+        let seed = unsafe { re.is_valid(i) }.then(|| unsafe { re.read_f64(i) } as i64);
+        let mut rng = dp::stream_rng(seed);
+        let res = dp::laplace_draw(&mut rng, b);
+        unsafe { out.write_str(i, &res) }
+    }
+}
+
+// mask(value) — Lua-compatible, mode-based
+unsafe extern "C" fn fn_mask1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    unary(input, output, mask::mask);
+}
+
+// mask(value, kind) — kind-aware PII masking
+unsafe extern "C" fn fn_mask2(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        match (col_str(input, 0, i), col_str(input, 1, i)) {
+            (Some(v), Some(kind)) => {
+                let res = pii::mask_kind(&objs(vec![("v", vs(&v)), ("kind", vs(&kind))]));
+                unsafe { out.write_str(i, &res) }
+            }
+            _ => unsafe { out.set_null(i) },
+        }
+    }
+}
+
+// mask_cn(value[, kind[, mode]])
+unsafe extern "C" fn fn_mask_cn1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    unary(input, output, mask::mask_cn);
+}
+
+unsafe extern "C" fn fn_mask_cn2(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        match (col_str(input, 0, i), col_str(input, 1, i)) {
+            (Some(v), Some(kind)) => {
+                let res = mask::mask_cn(&objs(vec![("v", vs(&v)), ("kind", vs(&cn_kind(&kind)))]));
+                unsafe { out.write_str(i, &res) }
+            }
+            _ => unsafe { out.set_null(i) },
+        }
+    }
+}
+
+unsafe extern "C" fn fn_mask_cn3(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        match (
+            col_str(input, 0, i),
+            col_str(input, 1, i),
+            col_str(input, 2, i),
+        ) {
+            (Some(v), Some(kind), Some(mode)) => {
+                let res = mask::mask_cn(&objs(vec![
+                    ("v", vs(&v)),
+                    ("kind", vs(&cn_kind(&kind))),
+                    ("mode", vs(&mode)),
+                ]));
+                unsafe { out.write_str(i, &res) }
+            }
+            _ => unsafe { out.set_null(i) },
+        }
+    }
+}
+
+// dateshift(value[, days])
+unsafe extern "C" fn fn_dateshift1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    unary(input, output, mask::dateshift);
+}
+
+unsafe extern "C" fn fn_dateshift2(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rd = unsafe { VectorReader::new(input, 1) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        let Some(v) = col_str(input, 0, i) else {
+            unsafe { out.set_null(i) };
+            continue;
+        };
+        let days = unsafe { rd.is_valid(i) }.then(|| unsafe { rd.read_f64(i) });
+        let mut o = vec![("v", vs(&v))];
+        if let Some(d) = days {
+            o.push(("days", vn(d)));
+        }
+        let res = mask::dateshift(&objs(o));
+        unsafe { out.write_str(i, &res) };
+    }
+}
+
+// dateoffset(date, delta_days) — undo a shift: date minus delta.
+// Three overloads so the natural call shapes bind: (VARCHAR, DOUBLE) plus
+// native (DATE, DOUBLE) / (DATE, BIGINT), which is what `date - orig`
+// produces. Without the DATE overloads DuckDB reports "no function matches"
+// because DATE does not implicitly cast to VARCHAR.
+unsafe fn dateoffset_row(input: duckdb_data_chunk, out: &mut VectorWriter, i: usize, days: i64) {
+    let Some(v) = col_str(input, 0, i) else {
+        unsafe { out.set_null(i) };
+        return;
+    };
+    let res = mask::date_plus_days(&v, -days);
+    unsafe { out.write_str(i, &res) }
+}
+
+unsafe extern "C" fn fn_dateoffset2(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rd = unsafe { VectorReader::new(input, 1) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rd.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let delta = unsafe { rd.read_f64(i) } as i64;
+        unsafe { dateoffset_row(input, &mut out, i, delta) }
+    }
+}
+
+unsafe extern "C" fn fn_dateoffset_date(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rdate = unsafe { VectorReader::new(input, 0) };
+    let rd = unsafe { VectorReader::new(input, 1) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        // DATE is stored as days since 1970-01-01 (i32).
+        if !unsafe { rdate.is_valid(i) } || !unsafe { rd.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let days = i64::from(unsafe { rdate.read_i32(i) });
+        let delta = unsafe { rd.read_f64(i) } as i64;
+        let (y, m, d) = mask::civil_from_days(days - delta);
+        unsafe { out.write_str(i, &format!("{y:04}-{m:02}-{d:02}")) }
+    }
+}
+
+unsafe extern "C" fn fn_dateoffset_date_i64(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let rdate = unsafe { VectorReader::new(input, 0) };
+    let rd = unsafe { VectorReader::new(input, 1) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rdate.is_valid(i) } || !unsafe { rd.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let days = i64::from(unsafe { rdate.read_i32(i) });
+        let delta = unsafe { rd.read_i64(i) };
+        let (y, m, d) = mask::civil_from_days(days - delta);
+        unsafe { out.write_str(i, &format!("{y:04}-{m:02}-{d:02}")) }
+    }
+}
+
+// redact_text(value) / redact_secrets(value)
+unsafe extern "C" fn fn_redact_text(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    unary(input, output, redact::redact_text);
+}
+
+unsafe extern "C" fn fn_redact_secrets(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    unary(input, output, redact::redact_secrets);
+}
+
+// fpe_encode(value, key, tweak) / fpe_decode(value, key, tweak)
+fn fpe3(input: duckdb_data_chunk, output: duckdb_vector, enc: bool) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        let (Some(v), Some(key)) = (col_str(input, 0, i), col_str(input, 1, i)) else {
+            unsafe { out.set_null(i) };
+            continue;
+        };
+        let tweak = col_str(input, 2, i).unwrap_or_default();
+        let mut o = vec![
+            ("v", vs(&v)),
+            ("key", vs(&key)),
+            (
+                "op",
+                vs(if enc { "fpe_encode" } else { "fpe_decode" }),
+            ),
+        ];
+        if !tweak.is_empty() {
+            o.push(("tweak", vs(&tweak)));
+        }
+        let res = fpe_value(&fpe::fpe_op(&objs(o), enc));
+        unsafe { out.write_str(i, &res) };
+    }
+}
+
+unsafe extern "C" fn fn_fpe_encode(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    fpe3(input, output, true);
+}
+
+unsafe extern "C" fn fn_fpe_decode(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    fpe3(input, output, false);
+}
+
+// dp_alloc(scope, key, epsilon, budget) — session ledger
+unsafe extern "C" fn fn_dp_alloc4(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let re = unsafe { VectorReader::new(input, 2) };
+    let rb = unsafe { VectorReader::new(input, 3) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        let (Some(scope), Some(key)) = (col_str(input, 0, i), col_str(input, 1, i)) else {
+            unsafe { out.set_null(i) };
+            continue;
+        };
+        let eps = unsafe { re.is_valid(i) }
+            .then(|| unsafe { re.read_f64(i) })
+            .unwrap_or(0.0);
+        let budget = unsafe { rb.is_valid(i) }
+            .then(|| unsafe { rb.read_f64(i) })
+            .unwrap_or(1.0);
+        let res = ledger::alloc(&scope, &key, eps, budget);
+        unsafe { out.write_str(i, &res) };
+    }
+}
+
+// dp_budget(scope) — session ledger report
+unsafe extern "C" fn fn_dp_budget1(
+    _i: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        match col_str(input, 0, i) {
+            Some(scope) => {
+                let res = ledger::report(&scope);
+                unsafe { out.write_str(i, &res) }
+            }
+            None => unsafe { out.set_null(i) },
+        }
     }
 }
 
 // ── registration ───────────────────────────────────────────────────
 
+/// Every privacy function returns VARCHAR; only the parameter list varies.
+macro_rules! varchar_overload {
+    ($($param:expr),*) => {
+        ScalarOverloadBuilder::new()
+            $(.param($param))*
+            .returns(TypeId::Varchar)
+    };
+}
+
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     unsafe {
+        // dispatcher
         reg.register_scalar(
             ScalarFunctionBuilder::new("privacy")
-                .param(TypeId::Varchar) // json_args
+                .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
-                .function(privacy_dispatch_fn),
+                .function(fn_privacy),
         )?;
 
+        // ── differential privacy ──
+        // Volatile for the same reason as laplace: a folded constant argument
+                // would reuse one noisy count for every row.
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("dp_count")
+                        .param(TypeId::BigInt)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_dp_count1),
+                )?;
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("dp_count")
+                        .param(TypeId::BigInt)
+                        .param(TypeId::Double)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_dp_count2),
+                )?;
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("dp_sum")
+                        .param(TypeId::Double)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_dp_sum1),
+                )?;
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("dp_sum")
+                        .param(TypeId::Double)
+                        .param(TypeId::Double)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_dp_sum2),
+                )?;
+        // Both overloads must be volatile: DuckDB folds constant-argument
+                // expressions, so a non-volatile noise function evaluated against a
+                // constant returns the *same* draw for every row of the result.
+                // ScalarFunctionSetBuilder (quack-rs 0.14) has no volatile flag, so the
+                // overloads are registered individually — DuckDB appends them to the
+                // same function set.
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("laplace")
+                        .param(TypeId::Double)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_laplace1),
+                )?;
+                reg.register_scalar(
+                    ScalarFunctionBuilder::new("laplace")
+                        .param(TypeId::Double)
+                        .param(TypeId::Double)
+                        .returns(TypeId::Varchar)
+                        .volatile()
+                        .function(fn_laplace2),
+                )?;
+        // dp_compose takes the JSON form straight through the dispatcher.
         reg.register_scalar(
-            ScalarFunctionBuilder::new("dp_count")
-                .param(TypeId::BigInt) // true_count
-                .param(TypeId::Double) // epsilon
+            ScalarFunctionBuilder::new("dp_compose")
+                .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
-                .function(fn_dp_count2),
+                .function(fn_privacy),
         )?;
         reg.register_scalar(
-            ScalarFunctionBuilder::new("dp_sum")
-                .param(TypeId::Double) // true_sum
-                .param(TypeId::Double) // epsilon
+            ScalarFunctionBuilder::new("dp_alloc")
+                .param(TypeId::Varchar)
+                .param(TypeId::Varchar)
+                .param(TypeId::Double)
+                .param(TypeId::Double)
                 .returns(TypeId::Varchar)
-                .function(fn_dp_sum2),
+                .function(fn_dp_alloc4),
         )?;
         reg.register_scalar(
-            ScalarFunctionBuilder::new("laplace")
-                .param(TypeId::Double) // scale b
+            ScalarFunctionBuilder::new("dp_budget")
+                .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
-                .function(fn_laplace2),
+                .function(fn_dp_budget1),
         )?;
 
-        reg.register_scalar(
-            ScalarFunctionBuilder::new("mask")
-                .param(TypeId::Varchar)
-                .returns(TypeId::Varchar)
-                .function(fn_mask),
+        // ── masking ──
+        reg.register_scalar_set(
+            ScalarFunctionSetBuilder::new("mask")
+                .overload(varchar_overload!(TypeId::Varchar).function(fn_mask1))
+                .overload(
+                    varchar_overload!(TypeId::Varchar, TypeId::Varchar).function(fn_mask2),
+                ),
         )?;
-        reg.register_scalar(
-            ScalarFunctionBuilder::new("mask_cn")
-                .param(TypeId::Varchar)
-                .returns(TypeId::Varchar)
-                .function(fn_mask_cn),
+        reg.register_scalar_set(
+            ScalarFunctionSetBuilder::new("mask_cn")
+                .overload(varchar_overload!(TypeId::Varchar).function(fn_mask_cn1))
+                .overload(
+                    varchar_overload!(TypeId::Varchar, TypeId::Varchar).function(fn_mask_cn2),
+                )
+                .overload(
+                    varchar_overload!(TypeId::Varchar, TypeId::Varchar, TypeId::Varchar)
+                        .function(fn_mask_cn3),
+                ),
         )?;
+
+        // ── date shifting ──
+        reg.register_scalar_set(
+            ScalarFunctionSetBuilder::new("dateshift")
+                .overload(varchar_overload!(TypeId::Varchar).function(fn_dateshift1))
+                .overload(
+                    varchar_overload!(TypeId::Varchar, TypeId::Double).function(fn_dateshift2),
+                ),
+        )?;
+        reg.register_scalar_set(
+            ScalarFunctionSetBuilder::new("dateoffset")
+                .overload(
+                    varchar_overload!(TypeId::Varchar, TypeId::Double).function(fn_dateoffset2),
+                )
+                .overload(
+                    varchar_overload!(TypeId::Date, TypeId::Double).function(fn_dateoffset_date),
+                )
+                .overload(
+                    varchar_overload!(TypeId::Date, TypeId::BigInt)
+                        .function(fn_dateoffset_date_i64),
+                ),
+        )?;
+
+        // ── free-text redaction ──
         reg.register_scalar(
-            ScalarFunctionBuilder::new("dateshift")
+            ScalarFunctionBuilder::new("redact_text")
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
-                .function(fn_dateshift),
+                .function(fn_redact_text),
         )?;
         reg.register_scalar(
             ScalarFunctionBuilder::new("redact_secrets")
@@ -303,14 +767,20 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .returns(TypeId::Varchar)
                 .function(fn_redact_secrets),
         )?;
+
+        // ── format-preserving encryption ──
         reg.register_scalar(
             ScalarFunctionBuilder::new("fpe_encode")
+                .param(TypeId::Varchar)
+                .param(TypeId::Varchar)
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
                 .function(fn_fpe_encode),
         )?;
         reg.register_scalar(
             ScalarFunctionBuilder::new("fpe_decode")
+                .param(TypeId::Varchar)
+                .param(TypeId::Varchar)
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
                 .function(fn_fpe_decode),

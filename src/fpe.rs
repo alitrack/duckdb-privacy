@@ -210,11 +210,22 @@ fn fpe_opts(p: &Value, _op: &str) -> Result<FpeOpts, String> {
     if alpha.chars().count() < 2 {
         return Err("fpe: 未知字母表（可用 digits/alnum/base64/hex 或传字母表字符串）".into());
     }
-    let key_hex = p.get_s("key").filter(|k| !k.is_empty()).unwrap_or("00000000000000000000000000000000");
-    if !matches!(key_hex.len(), 32 | 48 | 64) {
-        return Err("fpe: key 须为 32/48/64 位 hex（16/24/32 字节）".into());
+    let key_hex = p.get_s("key").unwrap_or_default();
+    if key_hex.is_empty() {
+        // Never fall back to an all-zero key: that encrypts with a publicly
+        // known constant and looks like working FPE while providing none.
+        return Err(
+            "fpe: key 必填（32/48/64 位 hex，即 16/24/32 字节；例 '0123456789abcdef0123456789abcdef'）"
+                .into(),
+        );
     }
-    let key = hex2bytes(key_hex)?;
+    if !matches!(key_hex.len(), 32 | 48 | 64) || hex2bytes(&key_hex).map(|b| b.len()).ok() != Some(key_hex.len() / 2) {
+        return Err(
+            "fpe: key 须为 32/48/64 位 hex（16/24/32 字节；例 '0123456789abcdef0123456789abcdef'）"
+                .into(),
+        );
+    }
+    let key = hex2bytes(&key_hex)?;
     let tlen = if algo == "ff31" { 14 } else { 16 };
     let tweak_hex = p.get_s("tweak").unwrap_or("").to_string();
     let tweak_hex = if tweak_hex.is_empty() {

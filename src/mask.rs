@@ -5,13 +5,13 @@
 use crate::json::{self, Value};
 use crate::rng::{fnv1a, Rng};
 
-fn s(v: &Value, k: &str) -> String {
+pub(crate) fn s(v: &Value, k: &str) -> String {
     v.get(k).map(json::to_str_lossy).unwrap_or_default()
 }
 fn f(v: &Value, k: &str) -> f64 {
     v.get(k).and_then(json::to_f64).unwrap_or(f64::NAN)
 }
-fn f_opt(v: &Value, k: &str) -> Option<f64> {
+pub(crate) fn f_opt(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(json::to_f64)
 }
 
@@ -78,7 +78,7 @@ pub fn mask(p: &Value) -> String {
 // ── CN compliance (op='mask_cn') ───────────────────────────────────
 
 /// Compound (复) surnames — keep 2 chars when the name starts with one.
-fn is_compound_surname(first2: &str) -> bool {
+pub(crate) fn is_compound_surname(first2: &str) -> bool {
     const S: &[&str] = &[
         "欧阳", "司马", "上官", "诸葛", "东方", "皇甫", "尉迟", "公孙", "慕容", "司徒",
         "令狐", "宇文", "长孙", "独孤", "南宫", "西门", "夏侯", "端木", "呼延", "澹台",
@@ -87,7 +87,7 @@ fn is_compound_surname(first2: &str) -> bool {
 }
 
 /// Fail-closed generic star over UTF-8 chars (head/tail default 1/1).
-fn generic_star(v: &str, head: Option<usize>, tail: Option<usize>) -> String {
+pub(crate) fn generic_star(v: &str, head: Option<usize>, tail: Option<usize>) -> String {
     let head = head.unwrap_or(1);
     let tail = tail.unwrap_or(1);
     let chars: Vec<char> = v.chars().collect();
@@ -395,6 +395,19 @@ pub fn dateshift(p: &Value) -> String {
 }
 
 /// op='dateoffset' → the key's offset days as integer string
+/// Shift a `YYYY-MM-DD[ HH:MM:SS]` date by `delta` days (negative = earlier).
+/// Returns `"null"` when the input does not parse, matching `dateshift`.
+pub fn date_plus_days(v: &str, delta: i64) -> String {
+    match parse_ymd_ts(v, "-") {
+        Some((y, m, d, ts)) => {
+            let (ny, nm, nd) = civil_from_days(days_from_civil(y, m, d) + delta);
+            fmt_dt(ny, nm, nd, "-", &ts)
+        }
+        None => "null".into(),
+    }
+}
+
+/// op='dateoffset' → the integer offset (in days) a key maps to.
 pub fn dateoffset(p: &Value) -> String {
     let days = f_opt(p, "days").map(|x| x.abs() as i64).unwrap_or(180);
     if days == 0 {

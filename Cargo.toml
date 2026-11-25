@@ -15,7 +15,10 @@ lto = true
 strip = true
 
 [dependencies]
-quack-rs = "0.14"
+# duckdb-1-5 enables ScalarFunctionBuilder::volatile — required here: DuckDB
+# constant-folds non-volatile scalar functions, which would make one noise draw
+# stand in for every row of a result set.
+quack-rs = { version = "0.14", features = ["duckdb-1-5"] }
 libduckdb-sys = "1.10504"
 regex = "=1.13.1"
 aes = "0.8"

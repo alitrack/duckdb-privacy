@@ -37,6 +37,7 @@ const PH: &[(&str, &str)] = &[
     ("date", "[**DATE**]"),
     ("idcard", "[**ID**]"),
     ("mobile", "[**PHONE**]"),
+    ("ssn", "[**SSN**]"),
     ("bankcard", "[**ACCT**]"),
     ("longnum", "[**NUM**]"),
 ];
@@ -98,14 +99,32 @@ fn bnd_ok_r(kind: &str, s: &str, e0: usize) -> bool {
 }
 
 fn valid_ymd(y: &str, m: &str, d: &str) -> bool {
-    let (ok, y, m, d) = match (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) {
-        (Ok(y), Ok(m), Ok(d)) => (true, y, m, d),
-        _ => return false,
+    // Parse all three fields; a non-numeric year makes the whole candidate a
+    // non-date. The year itself is deliberately unbounded (years before 1000 and
+    // after 9999 are still dates), but month and day must be real.
+    let (Ok(y), Ok(m), Ok(d)) = (
+        y.parse::<i64>(),
+        m.parse::<i64>(),
+        d.parse::<i64>(),
+    ) else {
+        return false;
     };
-    if !ok {
+    if !(1..=12).contains(&m) {
         return false;
     }
-    (1..=12).contains(&m) && (1..=31).contains(&d)
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let max_day = match m {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=max_day).contains(&d)
 }
 
 fn valid_ipv4(t: &str) -> bool {
@@ -172,6 +191,35 @@ fn add_dates(marks: &mut Vec<Mark>, s: &str) {
 }
 
 fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, num_min: usize) {
+    // ⓪ Separator-bearing identifiers. The contiguous `\d+` scan below cannot
+    // see these — a phone written 555-123-4567 splits into 555 / 123 / 4567 and
+    // an SSN 123-45-6789 into 123 / 45 / 6789, each too short to classify, so
+    // both were silently passing through unredacted.
+    let re_ssn = Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
+    for m in re_ssn.find_iter(s) {
+        if free(marks, m.start(), m.end()) {
+            marks.push(Mark {
+                s: m.start(),
+                e: m.end(),
+                id: "ssn",
+                ph: ph_of("ssn"),
+                sep: None,
+            });
+        }
+    }
+    // Phone: 3-3-4, 3-4-4, or 1-3-3-4 with dash/dot/space separators.
+    let re_phone = Regex::new(r"\b(?:\d[-. ])?\d{3}[-. ]\d{3,4}[-. ]\d{4}\b").unwrap();
+    for m in re_phone.find_iter(s) {
+        if free(marks, m.start(), m.end()) {
+            marks.push(Mark {
+                s: m.start(),
+                e: m.end(),
+                id: "mobile",
+                ph: ph_of("mobile"),
+                sep: None,
+            });
+        }
+    }
     // ① 4-4-4-4 space-grouped bank cards (contiguous %d+ scan misses these)
     let re4444 = Regex::new(r"\d{4} \d{4} \d{4} \d{4}").unwrap();
     for m in re4444.find_iter(s) {
@@ -997,5 +1045,51 @@ mod tests {
         } else {
             panic!("restored field missing");
         }
+    }
+}
+
+#[cfg(test)]
+mod separated_identifier_tests {
+    use super::*;
+    use crate::json;
+
+    fn redact(text: &str) -> String {
+        let p = json::obj(vec![("v", json::Value::Str(text.to_string()))]);
+        redact_text(&p)
+    }
+
+    /// Regression: dashes split a phone into three short runs, so the contiguous
+    /// digit scan never classified it and the number went out in clear text.
+    #[test]
+    fn dashed_phone_is_redacted() {
+        let out = redact("Call John at 555-123-4567 for the admission");
+        assert!(out.contains("[**PHONE**]"), "{out}");
+        assert!(!out.contains("555-123-4567"), "{out}");
+    }
+
+    /// Regression: same splitting problem for SSNs, and there was no SSN
+    /// placeholder at all, so `LIKE '%<SSN>%'` could never match.
+    #[test]
+    fn dashed_ssn_is_redacted() {
+        let out = redact("The SSN is 123-45-6789");
+        assert!(out.contains("[**SSN**]"), "{out}");
+        assert!(!out.contains("123-45-6789"), "{out}");
+    }
+
+    #[test]
+    fn spaced_and_dotted_phones_are_redacted() {
+        for t in ["call 138 1234 5678 now", "call 138.1234.5678 now"] {
+            let out = redact(t);
+            assert!(out.contains("[**PHONE**]"), "{t} -> {out}");
+        }
+    }
+
+    /// A date must stay a date: 2020-05-15 is 4-2-2, not an SSN, and the SSN
+    /// rule must not swallow it.
+    #[test]
+    fn date_is_not_mistaken_for_ssn() {
+        let out = redact("visit on 2020-05-15 for review");
+        assert!(out.contains("[**DATE**]"), "{out}");
+        assert!(!out.contains("[**SSN**]"), "{out}");
     }
 }

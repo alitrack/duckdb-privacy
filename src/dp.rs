@@ -5,33 +5,59 @@
 use crate::json::{self, Value};
 use crate::rng::Rng;
 
-fn f(v: &Value, k: &str) -> f64 {
-    v.get(k).and_then(json::to_f64).unwrap_or(f64::NAN)
-}
-
 fn f_opt(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(json::to_f64)
 }
 
-fn seed_of(p: &Value) -> i64 {
-    f_opt(p, "seed").map(|s| s as i64).unwrap_or_else(|| {
-        // Lua default: os.time() — wall clock seconds
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(1)
-    })
+// ── mechanisms ─────────────────────────────────────────────────────
+
+/// Resolve the Laplace scale. `scale` is canonical; `b` is the shorthand the
+/// SQL `laplace(scale[, seed])` surface uses. Reading only `scale` silently
+/// ignored the SQL argument and made every call draw at scale 1.0 — a caller
+/// asking for b=10 got 10x less noise than the ε they believed they had.
+fn scale_of(p: &Value) -> f64 {
+    f_opt(p, "scale").or_else(|| f_opt(p, "b")).unwrap_or(1.0)
 }
 
-// ── mechanisms ─────────────────────────────────────────────────────
+/// Wall-clock seconds — the fallback seed when the caller supplies none.
+pub fn clock_seed() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(1)
+}
+
+/// Park-Miller leaks its seed into the first output: x1 = 16807*seed, so a
+/// small seed yields a first draw that is heavily correlated with the seed and
+/// biased toward one side. Warming up first throws that correlation away —
+/// determinism per seed is preserved, the bias is not.
+const WARMUP: usize = 12;
+
+/// One RNG for a whole data chunk, warmed up and ready to be advanced once per
+/// row. Re-seeding per row is what made an unsseeded query add *identical*
+/// noise to every row in the same second, which is both useless and unsafe.
+pub fn stream_rng(seed: Option<i64>) -> Rng {
+    let mut r = Rng::new(seed.unwrap_or_else(clock_seed));
+    r.warm(WARMUP);
+    r
+}
 
 /// op='dp_count' → "123" (integer string)
 pub fn dp_count(p: &Value) -> String {
     let sensitivity = f_opt(p, "sensitivity").unwrap_or(1.0);
     let epsilon = f_opt(p, "epsilon").unwrap_or(1.0);
-    let scale = sensitivity / epsilon;
-    let mut rng = Rng::new(seed_of(p));
-    let v = f_opt(p, "true_count").unwrap_or(0.0) + rng.laplace(scale);
+    let mut rng = stream_rng(f_opt(p, "seed").map(|s| s as i64));
+    dp_count_draw(
+        &mut rng,
+        f_opt(p, "true_count").unwrap_or(0.0),
+        sensitivity,
+        epsilon,
+    )
+}
+
+/// Noisy count, drawn from a caller-owned RNG so one chunk can stream draws.
+pub fn dp_count_draw(rng: &mut Rng, true_count: f64, sensitivity: f64, epsilon: f64) -> String {
+    let v = true_count + rng.laplace(sensitivity / epsilon);
     format!("{}", (v + 0.5).floor() as i64)
 }
 
@@ -39,29 +65,60 @@ pub fn dp_count(p: &Value) -> String {
 pub fn dp_sum(p: &Value) -> String {
     let sensitivity = f_opt(p, "sensitivity").unwrap_or(100.0);
     let epsilon = f_opt(p, "epsilon").unwrap_or(1.0);
-    let mut rng = Rng::new(seed_of(p));
-    let v = f_opt(p, "true_sum").unwrap_or(0.0) + rng.laplace(sensitivity / epsilon);
+    let mut rng = stream_rng(f_opt(p, "seed").map(|s| s as i64));
+    dp_sum_draw(
+        &mut rng,
+        f_opt(p, "true_sum").unwrap_or(0.0),
+        sensitivity,
+        epsilon,
+    )
+}
+
+/// Noisy sum, drawn from a caller-owned RNG.
+pub fn dp_sum_draw(rng: &mut Rng, true_sum: f64, sensitivity: f64, epsilon: f64) -> String {
+    let v = true_sum + rng.laplace(sensitivity / epsilon);
     format!("{:.2}", v)
 }
 
 /// op='dp_mean' → "%.4f" or "null"
 pub fn dp_mean(p: &Value) -> String {
     let eps = f_opt(p, "epsilon").unwrap_or(1.0);
-    let mut rng = Rng::new(seed_of(p));
-    let s_sum = f_opt(p, "range").unwrap_or(100.0) / eps;
+    let mut rng = stream_rng(f_opt(p, "seed").map(|s| s as i64));
+    dp_mean_draw(
+        &mut rng,
+        f_opt(p, "true_sum").unwrap_or(0.0),
+        f_opt(p, "true_count").unwrap_or(0.0),
+        f_opt(p, "range").unwrap_or(100.0),
+        eps,
+    )
+}
+
+/// Noisy mean, drawn from a caller-owned RNG.
+pub fn dp_mean_draw(
+    rng: &mut Rng,
+    true_sum: f64,
+    true_count: f64,
+    range: f64,
+    eps: f64,
+) -> String {
+    let s_sum = range / eps;
     let s_cnt = 1.0 / eps;
-    let cnt = f_opt(p, "true_count").unwrap_or(0.0) + rng.laplace(s_cnt);
+    let cnt = true_count + rng.laplace(s_cnt);
     if cnt < 1.0 {
         return "null".into();
     }
-    let mean = (f_opt(p, "true_sum").unwrap_or(0.0) + rng.laplace(s_sum)) / cnt;
+    let mean = (true_sum + rng.laplace(s_sum)) / cnt;
     format!("{:.4}", mean)
 }
 
 /// op='laplace' → one Laplace(0, scale) draw, "%.6f"
 pub fn laplace(p: &Value) -> String {
-    let scale = f_opt(p, "scale").unwrap_or(1.0);
-    let mut rng = Rng::new(seed_of(p));
+    let mut rng = stream_rng(f_opt(p, "seed").map(|s| s as i64));
+    laplace_draw(&mut rng, scale_of(p))
+}
+
+/// One Laplace draw at `scale`, formatted for SQL output.
+pub fn laplace_draw(rng: &mut Rng, scale: f64) -> String {
     format!("{:.6}", rng.laplace(scale))
 }
 
@@ -321,4 +378,86 @@ mod tests {
         assert!(out.contains("budget_exceeded"));
     }
 
+}
+
+#[cfg(test)]
+mod dp_regression_tests {
+    use super::*;
+    use crate::json;
+
+    /// Regression: `laplace` read only the "scale" key while the SQL surface
+    /// passes "b", so every call silently drew at scale 1.0. Asking for b=10
+    /// used to return the same value as b=0.5 — a 20x error in the noise, which
+    /// means the effective epsilon was wrong by the same factor.
+    #[test]
+    fn laplace_honours_b() {
+        let draw = |b: f64| {
+            let p = json::obj(vec![
+                ("b", json::Value::Num(b)),
+                ("seed", json::Value::Num(4242.0)),
+            ]);
+            laplace(&p).parse::<f64>().unwrap()
+        };
+        let small = draw(0.5).abs();
+        let large = draw(10.0).abs();
+        assert!(
+            large > small * 3.0,
+            "b is ignored: b=0.5 -> {small}, b=10 -> {large}"
+        );
+    }
+
+    /// Regression: each SQL row re-seeded the RNG, so a whole chunk received one
+    /// identical draw. Streaming from a shared RNG must advance per row.
+    #[test]
+    fn streamed_draws_are_independent() {
+        let mut rng = stream_rng(Some(99));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(laplace_draw(&mut rng, 2.0));
+        }
+        assert_eq!(seen.len(), 64, "noise repeats across rows: {seen:?}");
+    }
+
+    /// Determinism per seed is still promised: same seed → same first draw.
+    #[test]
+    fn stream_seed_is_reproducible() {
+        let a = laplace_draw(&mut stream_rng(Some(7)), 1.0);
+        let b = laplace_draw(&mut stream_rng(Some(7)), 1.0);
+        assert_eq!(a, b);
+    }
+
+    /// Small / adjacent seeds must not bias the sign of the noise. Before the
+    /// warm-up, Park-Miller's first output was 16807*seed, which for seeds near
+    /// zero is always small → every draw landed on the same side.
+    #[test]
+    fn adjacent_small_seeds_are_not_one_sided() {
+        let mut pos = 0;
+        let mut neg = 0;
+        for seed in 1..=500i64 {
+            let v: f64 = laplace_draw(&mut stream_rng(Some(seed)), 1.0)
+                .parse()
+                .unwrap();
+            if v > 0.0 {
+                pos += 1;
+            } else {
+                neg += 1;
+            }
+        }
+        let ratio = f64::from(pos) / f64::from(pos + neg);
+        assert!(
+            (0.3..=0.7).contains(&ratio),
+            "sign bias for adjacent seeds: pos ratio {ratio:.3} (pos={pos}, neg={neg})"
+        );
+    }
+
+    /// dp_count over a chunk must give every row its own rounded value.
+    #[test]
+    fn dp_count_streams_per_row() {
+        let mut rng = stream_rng(Some(11));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            seen.insert(dp_count_draw(&mut rng, 1000.0, 1.0, 0.5));
+        }
+        assert!(seen.len() > 1, "dp_count produced one value for the chunk");
+    }
 }

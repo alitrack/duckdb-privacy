@@ -137,7 +137,9 @@ pub fn fmt_g(x: f64) -> String {
         }
         if dot_at == 0 {
             s.push_str("0.");
-            for _ in 0..(-exp) {
+            // digits[0] is the leading significant digit, so a value with
+            // exponent -1 needs zero padding zeros, -2 needs one, etc.
+            for _ in 0..(-exp - 1).max(0) {
                 s.push('0');
             }
             s.push_str(digits);
@@ -441,4 +443,39 @@ pub fn to_map(v: &Value) -> HashMap<String, &Value> {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod fmt_g_tests {
+    use super::fmt_g;
+
+    /// Regression: the negative-exponent branch used to emit one zero too many,
+    /// which divided every value in (0, 1) by ten (0.9 → "0.09"). Epsilon
+    /// budgets, p-values and ratios all flow through this formatter.
+    #[test]
+    fn sub_one_values_keep_their_scale() {
+        assert_eq!(fmt_g(0.9), "0.9");
+        assert_eq!(fmt_g(0.5), "0.5");
+        assert_eq!(fmt_g(0.55), "0.55");
+        assert_eq!(fmt_g(0.01), "0.01");
+        assert_eq!(fmt_g(0.001), "0.001");
+        assert_eq!(fmt_g(0.0001), "0.0001");
+        assert_eq!(fmt_g(-0.9), "-0.9");
+        assert_eq!(fmt_g(-0.001), "-0.001");
+    }
+
+    #[test]
+    fn integral_and_large_values() {
+        assert_eq!(fmt_g(0.0), "0");
+        assert_eq!(fmt_g(1.0), "1");
+        assert_eq!(fmt_g(2.0), "2");
+        assert_eq!(fmt_g(1234.5), "1234.5");
+        assert_eq!(fmt_g(100000.0), "100000");
+    }
+
+    #[test]
+    fn tiny_values_switch_to_exponent() {
+        assert_eq!(fmt_g(0.00001), "1e-05");
+        assert_eq!(fmt_g(0.000001), "1e-06");
+    }
 }
