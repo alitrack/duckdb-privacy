@@ -26,6 +26,8 @@ pub mod redact;
 pub mod rng;
 
 use quack_rs::{
+    table::{BindInfo, TableFunctionBuilder},
+    data_chunk::DataChunk,
     entry_point::init_extension_v2,
     prelude::*,
     vector::{VectorReader, VectorWriter},
@@ -456,7 +458,52 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .function(fake_scalar_words),
         )?;
     }
+
+    // native table function: SELECT * FROM fake(list := '<spec JSON>')
+    let tb = TableFunctionBuilder::new("fake")
+        .named_param("list", TypeId::Varchar)
+        .with_state::<FakeTableState, _>(|bind: &BindInfo| -> Result<FakeTableState, ExtensionError> {
+            bind.add_result_column("row_idx", TypeId::BigInt);
+            bind.add_result_column("val", TypeId::Varchar);
+            let list = unsafe { bind.get_named_parameter_value("list") }
+                .as_str_or_default();
+            if list.is_empty() {
+                return Err(ExtensionError::new("fake: 'list' is required"));
+            }
+            let spec = match crate::json::decode(&list) {
+                Ok(v) => v,
+                Err(_) => return Err(ExtensionError::new("fake: 'list' must be valid JSON")),
+            };
+            let rows = fake::build_rows(&spec)
+                .map_err(|e| ExtensionError::new(e))?;
+            Ok(FakeTableState { rows, next: 0 })
+        })
+        .scan(|st: &mut FakeTableState, chunk: &DataChunk| -> Result<(), ExtensionError> {
+            let total = st.rows.len();
+            if st.next >= total {
+                unsafe { chunk.set_size(0) };
+                return Ok(());
+            }
+            let mut w = 0usize;
+            while st.next < total && w < 256 {
+                unsafe { chunk.writer(0).write_i64(w, st.next as i64) };
+                unsafe { chunk.writer(1).write_str(w, &st.rows[st.next]) };
+                st.next += 1;
+                w += 1;
+            }
+            unsafe { chunk.set_size(w) };
+            Ok(())
+        })
+        .build()?;
+    unsafe { reg.register_table(tb)? };
+
     Ok(())
+}
+
+#[derive(Default)]
+struct FakeTableState {
+    rows: Vec<String>,
+    next: usize,
 }
 
 // Entry point — DuckDB expects the symbol `privacy_init_c_api`

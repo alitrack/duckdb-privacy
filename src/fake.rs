@@ -869,7 +869,7 @@ fn expand_template(rng: &mut Rng, template: &str) -> String {
 
 // ── row-level generation (op=rows / op=table / table function) ──────────────
 
-fn build_rows(spec: &Value, outer_seed: Option<f64>) -> Result<Vec<String>, String> {
+fn build_rows_inner(spec: &Value, outer_seed: Option<f64>) -> Result<Vec<String>, String> {
     let spec = match spec {
         Value::Obj(_) => spec,
         _ => return Err("spec must be a table (JSON string or struct)".into()),
@@ -962,6 +962,19 @@ fn err_obj(msg: &str) -> String {
     ]))
 }
 
+/// Build N row-strings from a spec (JSON string or parsed Value).
+/// Used by the `fake` table function and by `op=rows`.
+pub fn build_rows(spec: &Value) -> Result<Vec<String>, String> {
+    let spec = match spec {
+        Value::Str(s) => match crate::json::decode(s) {
+            Ok(v) => v,
+            Err(_) => return Err("spec must be valid JSON".into()),
+        },
+        other => other.clone(),
+    };
+    build_rows_inner(&spec, None)
+}
+
 /// `privacy('{op:"fake", ...}')` → output byte-compatible with the Lua `run()`.
 pub fn fake(v: &Value) -> String {
     if !v.is_obj() {
@@ -1015,7 +1028,7 @@ pub fn fake(v: &Value) -> String {
             if !spec.is_obj() {
                 return err_obj("spec must be a table or JSON string");
             }
-            match build_rows(spec, seed) {
+            match build_rows_inner(spec, seed) {
                 Ok(rows) => {
                     if op == "table" {
                         rows.join("\n")
