@@ -17,6 +17,7 @@
 //! call sites convert by wrapping the table as JSON.
 
 pub mod dp;
+pub mod fake;
 pub mod fpe;
 pub mod json;
 pub mod kanon;
@@ -74,6 +75,8 @@ fn dispatch(raw: &str) -> String {
         "fpe_encode" => fpe::fpe_op(&v, true),
         "fpe_decode" => fpe::fpe_op(&v, false),
         "fpe_luhn" => fpe::fpe_luhn(&v),
+        // fake generator: "fake" (module op, defaults to gen) + sub-ops
+        "fake" | "gen" | "rows" | "table" | "template" | "kinds" => fake::fake(&v),
         _ => String::new(),
     }
 }
@@ -177,6 +180,69 @@ unsafe extern "C" fn fn_fpe_decode(_info: duckdb_function_info, input: duckdb_da
         ]);
         unsafe { out.write_str(i, &fpe::fpe_op(&v, false)) };
     }
+}
+
+unsafe fn fake_scalar(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+    kind: &'static str,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rin = unsafe { VectorReader::new(input, 0) };
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        let seed: i64 = if unsafe { rin.is_valid(i) } {
+            unsafe { rin.read_str(i) }.parse().unwrap_or(0)
+        } else {
+            0
+        };
+        let v = json::obj(vec![
+            ("op", json::Value::Str("fake".into())),
+            ("kind", json::Value::Str(kind.into())),
+            ("seed", json::Value::Num(seed as f64)),
+        ]);
+        let res = fake::fake(&v);
+        unsafe { out.write_str(i, &res) };
+    }
+}
+
+// per-kind static dispatchers (DuckDB scalar fns take a fixed signature)
+unsafe extern "C" fn fake_scalar_name(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "person.full")
+}
+unsafe extern "C" fn fake_scalar_email(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "contact.email")
+}
+unsafe extern "C" fn fake_scalar_phone(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "contact.phone")
+}
+unsafe extern "C" fn fake_scalar_company(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "company.name")
+}
+unsafe extern "C" fn fake_scalar_address(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "address.full")
+}
+unsafe extern "C" fn fake_scalar_uuid(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "uuid")
+}
+unsafe extern "C" fn fake_scalar_int(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "number.int")
+}
+unsafe extern "C" fn fake_scalar_float(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "number.float")
+}
+unsafe extern "C" fn fake_scalar_bool(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "bool.b")
+}
+unsafe extern "C" fn fake_scalar_color(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "color.name")
+}
+unsafe extern "C" fn fake_scalar_date(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "date.iso")
+}
+unsafe extern "C" fn fake_scalar_words(info: duckdb_function_info, i: duckdb_data_chunk, o: duckdb_vector) {
+    fake_scalar(info, i, o, "text.words")
 }
 
 // Two-arg shortcut: dp_count(true_count, epsilon)
@@ -314,6 +380,80 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
                 .function(fn_fpe_decode),
+        )?;
+
+        // fake scalar shortcuts (one per common kind)
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_name")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_name),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_email")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_email),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_phone")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_phone),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_company")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_company),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_address")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_address),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_uuid")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_uuid),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_int")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_int),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_float")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_float),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_bool")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_bool),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_color")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_color),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_date")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_date),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("fake_words")
+                .param(TypeId::Varchar)
+                .returns(TypeId::Varchar)
+                .function(fake_scalar_words),
         )?;
     }
     Ok(())
