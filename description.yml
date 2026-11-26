@@ -12,4 +12,4 @@ extension:
 
 repo:
   github: alitrack/duckdb-privacy
-  ref: refs/tags/v0.1.0
+  ref: 05256f352187db98b5dd51ba7e6bb512bad1e9be
