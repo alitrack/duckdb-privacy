@@ -371,12 +371,28 @@ pub fn dp_budget(p: &Value) -> String {
         }
     }
     let spent = f_opt(p, "spent").unwrap_or(0.0);
+    // `ledger`/`spent` may parse to inf (1e309) or NaN; the BASIC path
+    // has no advanced-branch guard, so validate these here or the sums
+    // below emit `inf` tokens (not valid JSON).
+    if !spent.is_finite() || !list.iter().all(|x| x.is_finite()) {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("ledger and spent must be finite".into()),
+        )]));
+    }
     let extra = spent - list_sum(&list);
     if extra > 1e-12 {
         list.push(extra);
     }
     let before = list_sum(&list);
     let after_basic = before + request;
+    // Even finite ledger values can overflow the sum (1e308 + 1e308).
+    if !before.is_finite() || !after_basic.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("ledger sum overflowed (entries too large)".into()),
+        )]));
+    }
     let mut tot_before = before;
     let mut tot_after = after_basic;
     if comp == "advanced" {
@@ -668,5 +684,49 @@ mod dp_regression_tests {
             seen.insert(dp_count_draw(&mut rng, 1000.0, 1.0, 0.5));
         }
         assert!(seen.len() > 1, "dp_count produced one value for the chunk");
+    }
+}
+
+#[cfg(test)]
+mod dp_budget_basic_residual {
+    use super::*;
+
+    /// Round-5 residual: a finite `budget` with a non-finite `ledger`/`spent`
+    /// (1e309 -> inf) used to flow through the BASIC path (no advanced guard)
+    /// and be emitted as `inf`/`-inf` (not valid JSON). It must now error.
+    #[test]
+    fn dp_budget_basic_rejects_nonfinite_ledger() {
+        // ledger entry that parses to inf
+        let a = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(10.0)),
+            ("request", json::Value::Num(1.0)),
+            ("ledger", json::Value::Arr(vec![json::Value::Str("1e309".into())])),
+            ("composition", json::Value::Str("basic".into())),
+        ]));
+        assert!(a.contains("\"error\""), "nonfinite ledger gave {a}");
+        assert!(!a.contains("inf") && !a.contains("NaN"), "leak: {a}");
+        // `spent` that parses to inf
+        let b = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(10.0)),
+            ("request", json::Value::Num(1.0)),
+            ("spent", json::Value::Num(f64::INFINITY)),
+        ]));
+        assert!(b.contains("\"error\""), "inf spent gave {b}");
+        assert!(!b.contains("inf") && !b.contains("NaN"), "leak: {b}");
+        // sum overflow even with finite entries (1e308 + 1e308 -> inf)
+        let c = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(10.0)),
+            ("request", json::Value::Num(1.0)),
+            ("ledger", json::Value::Arr(vec![json::Value::Num(1e308), json::Value::Num(1e308)])),
+        ]));
+        assert!(c.contains("\"error\""), "overflow ledger gave {c}");
+        assert!(!c.contains("inf") && !c.contains("NaN"), "leak: {c}");
+        // normal finite input still works
+        let d = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(10.0)),
+            ("request", json::Value::Num(1.0)),
+            ("spent", json::Value::Num(5.0)),
+        ]));
+        assert!(!d.contains("\"error\""), "valid gave {d}");
     }
 }
