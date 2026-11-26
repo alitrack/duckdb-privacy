@@ -414,6 +414,17 @@ pub fn dp_budget(p: &Value) -> String {
         }
     }
     let allow = tot_after <= budget + 1e-12;
+    // remaining_before/after are budget minus a total: two finite values
+    // with opposite signs near the f64 ceiling make the difference overflow
+    // to +/-inf, which is not valid JSON. Reject at the emit point.
+    let rem_before = budget - tot_before;
+    let rem_after = budget - tot_after;
+    if !rem_before.is_finite() || !rem_after.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("remaining budget overflowed (budget and spent opposite signs near f64 max)".into()),
+        )]));
+    }
     format!(
         "{{\"allow\":{},\"composition\":\"{}\",\"budget\":{},\"request\":{},\"delta\":{},\"entries\":{},\
          \"spent_before\":{:.9},\"spent_after\":{:.9},\"total_before\":{:.9},\"total_after\":{:.9},\
@@ -428,8 +439,8 @@ pub fn dp_budget(p: &Value) -> String {
         after_basic,
         tot_before,
         tot_after,
-        budget - tot_before,
-        budget - tot_after,
+        rem_before,
+        rem_after,
         if allow { "ok" } else { "budget_exceeded" }
     )
 }
@@ -728,5 +739,26 @@ mod dp_budget_basic_residual {
             ("spent", json::Value::Num(5.0)),
         ]));
         assert!(!d.contains("\"error\""), "valid gave {d}");
+    }
+}
+
+#[cfg(test)]
+mod dp_budget_remaining_overflow {
+    use super::*;
+
+    /// Round-6 residual: finite opposite-sign budget/spent near the
+    /// f64 ceiling make remaining_before/after = budget - total overflow
+    /// to +/-inf. The emit point must now reject it with a structured
+    /// error instead of emitting a non-JSON token.
+    #[test]
+    fn remaining_overflow_rejected() {
+        let a = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(1.7e308)),
+            ("request", json::Value::Num(1.0)),
+            ("spent", json::Value::Num(-1.7e308)),
+            ("ledger", json::Value::Arr(vec![json::Value::Num(-1.7e308)])),
+        ]));
+        assert!(a.contains("\"error\""), "opposite-sign near-max gave {a}");
+        assert!(!a.contains("inf") && !a.contains("NaN"), "leak: {a}");
     }
 }
