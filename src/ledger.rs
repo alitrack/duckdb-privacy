@@ -7,9 +7,9 @@
 //! is keyed by scope string behind a process-wide mutex.
 //!
 //! Honest boundary: this is accounting, not enforcement. Nothing stops a caller
-//! from running a query anyway — `dp_alloc` refuses to record an over-budget
-//! allocation and `dp_budget` reports what is left, but the ledger is an audit
-//! trail, not a sandbox.
+//! from running a query anyway — `dp_alloc` records every allocation (over
+//! budget or not, flagged `over_budget: true`) and `dp_budget` reports what is
+//! left, but the ledger is an audit trail, not a sandbox.
 
 use crate::json::{self, Value};
 use std::collections::HashMap;

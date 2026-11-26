@@ -276,6 +276,19 @@ pub fn civil_from_days(z0: i64) -> (i64, i64, i64) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
+/// Auto-detect the date separator and parse, trying '-' / '/' / '.' / 'cn'
+/// (the CJK form) in turn. Lets `dateshift`/`date_plus_days` handle
+/// "2020-03-05", "2020/03/05", "2020.03.05" and "2020年03月05日" without the
+/// caller having to know which form it is.
+fn parse_ymd_any(v: &str) -> Option<(i64, i64, i64, String, &'static str)> {
+    for sep in ["-", "/", ".", "cn"] {
+        if let Some(r) = parse_ymd_ts(v, sep) {
+            return Some((r.0, r.1, r.2, r.3, sep));
+        }
+    }
+    None
+}
+
 /// Parse 'YYYY-MM-DD[ HH:MM:SS]' (sep '-', '/', '.' or 'cn').
 /// Returns (y, m, d, tsuffix) where tsuffix keeps its leading space.
 fn parse_ymd_ts(v: &str, sep: &str) -> Option<(i64, i64, i64, String)> {
@@ -285,12 +298,15 @@ fn parse_ymd_ts(v: &str, sep: &str) -> Option<(i64, i64, i64, String)> {
         "/" => v.splitn(4, '/').collect::<Vec<_>>(),
         "." => v.splitn(4, '.').collect::<Vec<_>>(),
         "cn" => {
-            // YYYY年MM月DD日rest
-            let rest1 = v.strip_prefix(|c: char| c.is_ascii_digit()).filter(|s| s.len() == 4)?;
-            let (ym, after) = rest1.split_once('年')?;
-            let (md, after2) = after.split_once('月')?;
-            let (dd, after3) = after2.split_once('日')?;
-            vec![ym, md, dd, after3]
+            // YYYY年MM月DD日rest — split on the three CJK separators. The
+            // digit-ness and 4-digit-year checks are done by the shared
+            // validation below, so the previous `strip_prefix(...)` (which
+            // measured the *remainder*, never the year) is gone: it made this
+            // branch return None for every real date.
+            let (year, after) = v.split_once('年')?;
+            let (month, after2) = after.split_once('月')?;
+            let (day, after3) = after2.split_once('日')?;
+            vec![year, month, day, after3]
         }
         _ => return None,
     };
@@ -378,14 +394,16 @@ pub fn dateshift(p: &Value) -> String {
     if v.is_empty() {
         return "null".into();
     }
-    let Some((y, m, d, ts)) = parse_ymd_ts(&v, "-") else {
+    let Some((y, m, d, ts, sep)) = parse_ymd_any(&v) else {
         return "null".into();
     };
     let days = f_opt(p, "days").map(|x| x.abs() as i64).unwrap_or(180);
     let salt = if s(p, "salt").is_empty() { "dateshift".to_string() } else { s(p, "salt") };
     let off = key_offset(&s(p, "key"), &salt, days);
     let (ny, nm, nd) = civil_from_days(days_from_civil(y, m, d) + off);
-    let out = fmt_dt(ny, nm, nd, "-", &ts);
+    // Re-emit the same separator the input used, so a "2020-03-05" stays
+    // "YYYY-MM-DD" and "2020年03月05日" stays "YYYY年MM月DD日".
+    let out = fmt_dt(ny, nm, nd, sep, &ts);
     if p.get("with_delta").is_some()
         && matches!(p.get("with_delta"), Some(Value::Bool(true)))
     {
@@ -394,14 +412,14 @@ pub fn dateshift(p: &Value) -> String {
     out
 }
 
-/// op='dateoffset' → the key's offset days as integer string
-/// Shift a `YYYY-MM-DD[ HH:MM:SS]` date by `delta` days (negative = earlier).
-/// Returns `"null"` when the input does not parse, matching `dateshift`.
+/// Shift a date by `delta` days (negative = earlier). Auto-detects the
+/// separator (like `dateshift`) so a `YYYY年MM月DD日` input re-emits in that
+/// form; returns `"null"` when the input does not parse, matching `dateshift`.
 pub fn date_plus_days(v: &str, delta: i64) -> String {
-    match parse_ymd_ts(v, "-") {
-        Some((y, m, d, ts)) => {
+    match parse_ymd_any(v) {
+        Some((y, m, d, ts, sep)) => {
             let (ny, nm, nd) = civil_from_days(days_from_civil(y, m, d) + delta);
-            fmt_dt(ny, nm, nd, "-", &ts)
+            fmt_dt(ny, nm, nd, sep, &ts)
         }
         None => "null".into(),
     }
@@ -473,6 +491,53 @@ mod tests {
         };
         assert_eq!(p(&oa), days_from_civil(2020, 3, 15) + (p(&ob) - days_from_civil(2020, 4, 15)));
         assert_eq!(p(&ob) - p(&oa), days_from_civil(2020, 4, 15) - days_from_civil(2020, 3, 15));
+    }
+
+    /// Regression (P3): the 'cn' branch was dead — `strip_prefix` measured the
+    /// *remainder* after dropping digit-leading chars, so `len()==4` was never
+    /// true for a real `2020年03月05日` and the branch always returned None.
+    /// After the fix, a Chinese date must parse and `dateshift` must move it,
+    /// re-emitting the 年月日 form.
+    #[test]
+    fn cn_date_shifts() {
+        // parse_ymd_ts('cn') now parses (was always None before)
+        let (y, m, d, _) = parse_ymd_ts("2020年03月05日", "cn").expect("cn date must parse");
+        assert_eq!((y, m, d), (2020, 3, 5));
+
+        // dateshift auto-detects the separator and shifts, keeping the 年月日 form
+        let p = Value::Obj(vec![
+            ("v".into(), Value::Str("2020年03月05日".into())),
+            ("key".into(), Value::Str("k1".into())),
+            ("days".into(), Value::Num(180.0)),
+        ]);
+        let out = dateshift(&p);
+        assert_ne!(out, "null", "cn date must not be null: {out}");
+        assert!(out.contains('年'), "output keeps 年: {out}");
+        assert!(out.contains('月'), "output keeps 月: {out}");
+        assert!(out.contains('日'), "output keeps 日: {out}");
+        // and it actually moved (different from the input date)
+        assert_ne!(out, "2020年03月05日");
+
+        // the relative-spacing invariant holds across two cn dates sharing a key
+        let a = Value::Obj(vec![
+            ("v".into(), Value::Str("2020年03月01日".into())),
+            ("key".into(), Value::Str("k1".into())),
+            ("days".into(), Value::Num(180.0)),
+        ]);
+        let b = Value::Obj(vec![
+            ("v".into(), Value::Str("2020年04月01日".into())),
+            ("key".into(), Value::Str("k1".into())),
+            ("days".into(), Value::Num(180.0)),
+        ]);
+        let day = |s: &str| {
+            let (y, m, d, _, _) = parse_ymd_any(s).expect("shifted cn date must re-parse");
+            days_from_civil(y, m, d)
+        };
+        assert_eq!(
+            day(&dateshift(&b)) - day(&dateshift(&a)),
+            days_from_civil(2020, 4, 1) - days_from_civil(2020, 3, 1),
+            "cn shift preserves relative day spacing"
+        );
     }
 
     #[test]

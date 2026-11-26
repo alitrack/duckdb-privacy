@@ -54,6 +54,13 @@ CREATE TEMP TABLE td AS SELECT dateshift('2020-05-15') AS s, '2020-05-15' AS ori
 SELECT dateoffset(s::DATE, s::DATE - orig::DATE) = orig AS dateoffset_roundtrip FROM td;
 DROP TABLE td;
 
+-- Chinese dates (YYYY年MM月DD日): the 'cn' branch was dead code, so before the
+-- fix dateshift('2020-05-01') returned 'null' and the date passed through
+-- unmasked. Now it auto-detects the separator, shifts, and keeps the 年月日 form.
+SELECT dateshift('2020年05月01日') LIKE '%年%月%日%' AS dateshift_cn_format;
+SELECT dateshift('2020年05月01日') IS NOT NULL AND dateshift('2020年05月01日') <> 'null'
+  AS dateshift_cn_not_null;
+
 -- ── redact_text: PHI types, including separator-bearing identifiers ──
 SELECT redact_text('Call John at 555-123-4567 for the admission at St Mary''s Hospital')
   LIKE '%[**PHONE**]%' AS redact_phone;

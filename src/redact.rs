@@ -176,10 +176,11 @@ fn add_pattern(
     }
 }
 
-fn add_dates(marks: &mut Vec<Mark>, s: &str) {
-    for (pat, sep) in DATE_FORMS {
-        let re = Regex::new(pat).unwrap();
-        for caps in re.captures_iter(s) {
+fn add_dates(marks: &mut Vec<Mark>, s: &str, re: &TextRe) {
+    // `re.date` is parallel to `DATE_FORMS` (one compiled regex per separator).
+    for i in 0..DATE_FORMS.len() {
+        let sep = DATE_FORMS[i].1;
+        for caps in re.date[i].captures_iter(s) {
             let (s0, e0) = (caps.get(0).unwrap().start(), caps.get(0).unwrap().end());
             if valid_ymd(&caps[1], &caps[2], &caps[3]) && free(marks, s0, e0) {
                 marks.push(Mark {
@@ -194,13 +195,12 @@ fn add_dates(marks: &mut Vec<Mark>, s: &str) {
     }
 }
 
-fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, num_min: usize) {
+fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, re: &TextRe, num_min: usize) {
     // ⓪ Separator-bearing identifiers. The contiguous `\d+` scan below cannot
     // see these — a phone written 555-123-4567 splits into 555 / 123 / 4567 and
     // an SSN 123-45-6789 into 123 / 45 / 6789, each too short to classify, so
     // both were silently passing through unredacted.
-    let re_ssn = Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
-    for m in re_ssn.find_iter(s) {
+    for m in re.ssn.find_iter(s) {
         if free(marks, m.start(), m.end()) {
             marks.push(Mark {
                 s: m.start(),
@@ -212,8 +212,7 @@ fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, num_min: usize) {
         }
     }
     // Phone: 3-3-4, 3-4-4, or 1-3-3-4 with dash/dot/space separators.
-    let re_phone = Regex::new(r"\b(?:\d[-. ])?\d{3}[-. ]\d{3,4}[-. ]\d{4}\b").unwrap();
-    for m in re_phone.find_iter(s) {
+    for m in re.phone.find_iter(s) {
         if free(marks, m.start(), m.end()) {
             marks.push(Mark {
                 s: m.start(),
@@ -225,8 +224,7 @@ fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, num_min: usize) {
         }
     }
     // ① 4-4-4-4 space-grouped bank cards (contiguous %d+ scan misses these)
-    let re4444 = Regex::new(r"\d{4} \d{4} \d{4} \d{4}").unwrap();
-    for m in re4444.find_iter(s) {
+    for m in re.bank4444.find_iter(s) {
         if bnd_ok_l("num", s, m.start()) && bnd_ok_r("num", s, m.end()) && free(marks, m.start(), m.end()) {
             marks.push(Mark {
                 s: m.start(),
@@ -238,8 +236,7 @@ fn add_digit_runs(marks: &mut Vec<Mark>, s: &str, num_min: usize) {
         }
     }
     // ② contiguous digit runs, classified by length/prefix
-    let re_digits = Regex::new(r"\d+").unwrap();
-    for m in re_digits.find_iter(s) {
+    for m in re.digits.find_iter(s) {
         let (s0, e0) = (m.start(), m.end());
         let run = &s[s0..e0];
         let n = run.len();
@@ -334,20 +331,63 @@ fn add_dict(
     }
 }
 
-fn redact_shift_date(txt: &str, sep: &str, key: &str, salt: &str, days: i64) -> Option<String> {
-    let (y, m, d) = if sep == "cn" {
-        let re = Regex::new(r"^(\d{4})年(\d{1,2})月(\d{1,2})日$").unwrap();
-        let caps = re.captures(txt)?;
-        (caps[1].parse().ok()?, caps[2].parse().ok()?, caps[3].parse().ok()?)
-    } else {
-        let re = Regex::new(&format!(
-            r"^(\d{{4}}){s}(\d{{1,2}})){s}(\d{{1,2}})$",
-            s = regex::escape(&sep.to_string())
-        ))
-        .unwrap();
-        let caps = re.captures(txt)?;
-        (caps[1].parse().ok()?, caps[2].parse().ok()?, caps[3].parse().ok()?)
+/// The compiled `redact_text` rule set, built once. `redact_text` is a hot path
+/// (one call per PHI value in a column) and the original ported code rebuilt
+/// ~11 of these regexes on every call; `OnceLock` compiles them once (the same
+/// pattern `redact_secrets` already uses via `SEC_RULES_LAZY`).
+#[derive(Clone)]
+struct TextRe {
+    email: Regex,
+    url: Regex,
+    ip: Regex,
+    /// parallel to `DATE_FORMS` (one compiled form per separator)
+    date: [Regex; 4],
+    ssn: Regex,
+    phone: Regex,
+    bank4444: Regex,
+    digits: Regex,
+    /// date-shift reparsers, one per separator (so a shifted date is
+    /// re-emitted in the *same* form it was read)
+    shift_dash: Regex,
+    shift_slash: Regex,
+    shift_dot: Regex,
+    shift_cn: Regex,
+}
+
+static TEXT_RE: OnceLock<TextRe> = OnceLock::new();
+
+fn text_re() -> &'static TextRe {
+    TEXT_RE.get_or_init(|| TextRe {
+        email: Regex::new(r"[\w_][\w.\-+%]*@[\w.\-]+\.[a-zA-Z]{2,}").unwrap(),
+        url: Regex::new(r"https?://[\w.\-%/?=&#:+~]+").unwrap(),
+        ip: Regex::new(r"\d+\.\d+\.\d+\.\d+").unwrap(),
+        date: [
+            Regex::new(DATE_FORMS[0].0).unwrap(),
+            Regex::new(DATE_FORMS[1].0).unwrap(),
+            Regex::new(DATE_FORMS[2].0).unwrap(),
+            Regex::new(DATE_FORMS[3].0).unwrap(),
+        ],
+        ssn: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
+        phone: Regex::new(r"\b(?:\d[-. ])?\d{3}[-. ]\d{3,4}[-. ]\d{4}\b").unwrap(),
+        bank4444: Regex::new(r"\d{4} \d{4} \d{4} \d{4}").unwrap(),
+        digits: Regex::new(r"\d+").unwrap(),
+        shift_dash: Regex::new(r"^(\d{4})-(\d{1,2})-(\d{1,2})$").unwrap(),
+        shift_slash: Regex::new(r"^(\d{4})/(\d{1,2})/(\d{1,2})$").unwrap(),
+        shift_dot: Regex::new(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})$").unwrap(),
+        shift_cn: Regex::new(r"^(\d{4})年(\d{1,2})月(\d{1,2})日$").unwrap(),
+    })
+}
+
+fn redact_shift_date(txt: &str, sep: &str, re: &TextRe, key: &str, salt: &str, days: i64) -> Option<String> {
+    let pick = match sep {
+        "-" => &re.shift_dash,
+        "/" => &re.shift_slash,
+        "." => &re.shift_dot,
+        "cn" => &re.shift_cn,
+        _ => return None,
     };
+    let caps = pick.captures(txt)?;
+    let (y, m, d) = (caps[1].parse().ok()?, caps[2].parse().ok()?, caps[3].parse().ok()?);
     let off = key_offset(key, salt, days);
     let (ny, nm, nd) = civil_from_days(days_from_civil(y, m, d) + off);
     if sep == "cn" {
@@ -373,13 +413,13 @@ pub fn redact_text(p: &Value) -> String {
     let salt = s(p, "salt");
     let salt = if salt.is_empty() { "dateshift" } else { &salt };
 
-    // priority: structured (email/URL/IP/dates) → dict → digit runs
-    let re_email = Regex::new(r"[\w_][\w.\-+%]*@[\w.\-]+\.[a-zA-Z]{2,}").unwrap();
-    add_pattern(&mut marks, &src, &re_email, "email", "email");
-    let re_url = Regex::new(r"https?://[\w.\-%/?=&#:+~]+").unwrap();
-    add_pattern(&mut marks, &src, &re_url, "url", "");
-    let re_ip = Regex::new(r"\d+\.\d+\.\d+\.\d+").unwrap();
-    for m in re_ip.find_iter(&src) {
+    // priority: structured (email/URL/IP/dates) → dict → digit runs.
+    // `text_re()` returns the process-wide compiled rule set (OnceLock) so the
+    // ~11 regexes are built once, not recompiled on every PHI value.
+    let re = text_re();
+    add_pattern(&mut marks, &src, &re.email, "email", "email");
+    add_pattern(&mut marks, &src, &re.url, "url", "");
+    for m in re.ip.find_iter(&src) {
         let cand = &src[m.start()..m.end()];
         if bnd_ok_l("ip", &src, m.start())
             && bnd_ok_r("ip", &src, m.end())
@@ -395,9 +435,9 @@ pub fn redact_text(p: &Value) -> String {
             });
         }
     }
-    add_dates(&mut marks, &src);
+    add_dates(&mut marks, &src, re);
     add_dict(&mut marks, &src, p.get_arr("dict"), &mut map, &mut order);
-    add_digit_runs(&mut marks, &src, num_min);
+    add_digit_runs(&mut marks, &src, re, num_min);
 
     marks.sort_by_key(|m| m.s);
     let mut out = String::new();
@@ -409,7 +449,7 @@ pub fn redact_text(p: &Value) -> String {
         let mut rep = m.ph.clone();
         if m.id == "date" && shift {
             if let Some(sep) = m.sep {
-                if let Some(shifted) = redact_shift_date(&src[m.s..m.e], sep, &key, salt, days) {
+                if let Some(shifted) = redact_shift_date(&src[m.s..m.e], sep, re, &key, salt, days) {
                     rep = shifted.clone();
                     shifted_dates.push(shifted);
                 }
@@ -566,10 +606,14 @@ fn sec_add_pem(marks: &mut Vec<Mark>, s: &str) {
                 if es0 - m.start() >= 20 {
                     if let Some(e1_rel) = s[es0..].find("PRIVATE KEY-----") {
                         let e1 = es0 + e1_rel;
-                        if free(marks, m.start(), e1 + 15) {
+                        // The END marker is `PRIVATE KEY-----` = 16 chars
+                        // (7+1+3+5); e1 is its start, so the block ends at
+                        // e1+16 (was e1+15, leaving the final '-' outside the
+                        // redacted span).
+                        if free(marks, m.start(), e1 + 16) {
                             marks.push(Mark {
                                 s: m.start(),
-                                e: e1 + 15,
+                                e: e1 + 16,
                                 id: "pem",
                                 ph: sec_ph("pem"),
                                 sep: None,
@@ -986,6 +1030,25 @@ mod tests {
         assert!(text.contains("[**PASS**]"), "connstr: {}", text);
         assert!(text.contains("[**IP**]"), "ip: {}", text);
         assert!(text.contains("postgres://user:"), "scheme/user kept: {}", text);
+    }
+
+    /// Regression (P3): the redacted PEM span ended at `e1+15`, but the END
+    /// marker `PRIVATE KEY-----` is 16 chars, so the final '-' of the marker
+    /// leaked out after the `[**PEM**]` placeholder. After the fix the whole
+    /// block — including that trailing dash — is inside the redacted span.
+    #[test]
+    fn pem_block_leaves_no_trailing_dash() {
+        // a minimal 20+ char "key" body between the BEGIN/END markers
+        let body = "-----BEGIN RSA PRIVATE KEY-----\nMIIkeydata0123456789ABCDEF\n-----END RSA PRIVATE KEY-----\n";
+        let out = redact_secrets(&p(body));
+        let v = json::decode(&out).unwrap();
+        let text = v.get_s("text").unwrap().to_string();
+        assert!(text.contains("[**PEM**]"), "pem redacted: {text}");
+        // the char right after the placeholder must not be a stray '-' from the
+        // marker; with the fix the placeholder is followed by a newline.
+        assert!(!text.contains("[**PEM**]-"), "no trailing dash: {text}");
+        // and the original body text is gone
+        assert!(!text.contains("MIIkeydata"), "body removed: {text}");
     }
 
     #[test]

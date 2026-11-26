@@ -359,6 +359,45 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     if !numeric || u.len() < 2 {
         return None;
     }
+    // Re-key each distribution by its parsed numeric value instead of by the
+    // fmt_g string. A sensitive field stored as a non-canonical numeric string
+    // ("1e5", "100.0", "75000.00") is keyed by its original text in
+    // build_dist, so the old `fmt_g(u[i])` lookup silently returned 0 for it
+    // and the cumulative mass (hence t-closeness / EMD) was wrong. Keying by
+    // f64 also collapses equivalent forms ("100"/"100.0") onto one point.
+    //
+    // A HashMap can't be keyed by f64 (no Hash/Eq for floats), so accumulate
+    // into a Vec, sort, and merge near-equal values. Each u[i] is one of the
+    // accumulated keys, so the binary search below always lands.
+    let mut num_g: Vec<(f64, i64)> = dg
+        .iter()
+        .filter_map(|(k, c)| k.parse::<f64>().ok().map(|x| (x, *c)))
+        .collect();
+    let mut num_q: Vec<(f64, i64)> = dq
+        .iter()
+        .filter_map(|(k, c)| k.parse::<f64>().ok().map(|x| (x, *c)))
+        .collect();
+    num_g.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    num_q.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let merge = |v: &mut Vec<(f64, i64)>| {
+        v.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-15);
+        let mut out: Vec<(f64, i64)> = Vec::with_capacity(v.len());
+        for (x, c) in v.iter() {
+            match out.last_mut() {
+                Some(last) if (last.0 - *x).abs() < 1e-15 => last.1 += *c,
+                _ => out.push((*x, *c)),
+            }
+        }
+        *v = out;
+    };
+    merge(&mut num_g);
+    merge(&mut num_q);
+    let count_at = |v: &[(f64, i64)], x: f64| -> i64 {
+        match v.binary_search_by(|e| e.0.partial_cmp(&x).unwrap()) {
+            Ok(i) => v[i].1,
+            Err(_) => 0,
+        }
+    };
     u.sort_by(|a, b| a.partial_cmp(b).unwrap());
     u.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     let span = u[u.len() - 1] - u[0];
@@ -369,9 +408,8 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     let mut cum_q = 0.0;
     let mut s = 0.0;
     for i in 0..u.len() - 1 {
-        let ks = format!("{}", json::fmt_g(u[i]));
-        cum_g += *dg.get(&ks).unwrap_or(&0) as f64 / ng as f64;
-        cum_q += *dq.get(&ks).unwrap_or(&0) as f64 / nq as f64;
+        cum_g += count_at(&num_g, u[i]) as f64 / ng as f64;
+        cum_q += count_at(&num_q, u[i]) as f64 / nq as f64;
         s += (cum_g - cum_q).abs() * (u[i + 1] - u[i]);
     }
     Some(s / span)
@@ -620,6 +658,28 @@ mod tests {
         ]);
         let out = kanon(&p);
         assert!(out.contains("\"suppressed\":3"));
+    }
+
+    /// Regression (P2): `emd_1d` used to look each support point up as
+    /// `fmt_g(parsed_value)` in the *string-keyed* distribution. A sensitive
+    /// field stored as a non-canonical numeric string ("1e5") parses to
+    /// 100000.0, but `fmt_g(100000.0)` is "100000", so the lookup silently
+    /// returned 0 and the cumulative mass (→ t-closeness / EMD) was wrong.
+    ///
+    /// Two distributions that are *identical in value* — one record at each of
+    /// 1.0, 100000.0, 999999.0 — differ only in spelling one of them "1e5"
+    /// vs "100000". The (non-canonical) 100000.0 sits in the interior, so the
+    /// old fmt_g keying dropped its mass and reported a spurious EMD (~0.30);
+    /// re-keying by the parsed f64 correctly collapses both spellings onto one
+    /// point, so the EMD must be exactly 0.
+    #[test]
+    fn emd_ignores_noncanonical_spelling() {
+        let dg: HashMap<String, i64> = [("1".into(), 1), ("1e5".into(), 1), ("999999".into(), 1)]
+            .into_iter().collect();
+        let dq: HashMap<String, i64> = [("1".into(), 1), ("100000".into(), 1), ("999999".into(), 1)]
+            .into_iter().collect();
+        let e = emd_1d(&dg, 3, &dq, 3).expect("numeric distributions must yield an EMD");
+        assert!((e - 0.0).abs() < 1e-9, "identical distributions have EMD 0, got {e}");
     }
 
     #[test]
