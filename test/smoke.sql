@@ -61,6 +61,12 @@ SELECT redact_text('Patient born 1985-03-12, MRN: A-12345')
   LIKE '%[**DATE**]%' AS redact_dob;
 SELECT redact_text('The SSN is 123-45-6789') LIKE '%[**SSN**]%' AS redact_ssn;
 
+-- ── redact_text: CJK characters directly adjacent to a number (no space).
+-- Regression: a single-byte boundary slice put the cut mid-character here and
+-- panicked -> SIGABRT the whole DuckDB process. Must redact, not crash. ──
+SELECT redact_text('手机号13812345678谢谢') LIKE '%[**PHONE**]%' AS redact_cjk_phone;
+SELECT redact_text('联系电话13912345678') LIKE '%[**PHONE**]%' AS redact_cjk_phone_right;
+
 -- ── FPE: key is mandatory (an all-zero key would be no encryption) ──
 SELECT fpe_encode('1234567890123456', 'key12345678901', '00000000000000')
   LIKE '%key%' AS fpe_rejects_bad_key;
@@ -85,6 +91,9 @@ SELECT fpe_encode('1234567890123456', '0123456789abcdef0123456789abcdef', '00000
 -- ── dispatcher: unknown op / bad JSON are NULL, not empty string ──
 SELECT privacy('{"op":"nonexistent","x":1}') IS NULL AS unknown_op_is_null;
 SELECT privacy('not json') IS NULL AS bad_json_is_null;
+-- Truncated escape: a JSON string that ends on a backslash / has a short \u
+-- used to index past the buffer (-> SIGABRT). Must be NULL, not a crash.
+SELECT privacy('{"v":"abc\') IS NULL AS truncated_escape_is_null;
 SELECT privacy('{"op":"mask","v":"13812345678","kind":"phone"}') = '138****5678'
   AS dispatcher_respects_kind;
 

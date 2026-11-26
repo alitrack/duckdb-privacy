@@ -61,7 +61,9 @@ fn bnd_ok_l(kind: &str, s: &str, s0: usize) -> bool {
     if s0 == 0 {
         return true;
     }
-    let c = s[s0 - 1..s0].chars().next().unwrap();
+    // `chars().next_back()` (not a single-byte slice): CJK neighbors put the
+    // char boundary mid-slice and `s[s0-1..s0]` would panic -> process abort.
+    let c = s[..s0].chars().next_back().unwrap();
     if c.is_ascii_alphanumeric() || c == '_' {
         return false;
     }
@@ -83,7 +85,9 @@ fn bnd_ok_r(kind: &str, s: &str, e0: usize) -> bool {
     if e0 >= s.len() {
         return true;
     }
-    let c = s[e0..e0 + 1].chars().next().unwrap();
+    // `chars().next()` (not a single-byte slice): CJK neighbors break the
+    // byte slice and panic -> process abort (see bnd_ok_l).
+    let c = s[e0..].chars().next().unwrap();
     if c.is_ascii_alphanumeric() || c == '_' {
         return false;
     }
@@ -1057,6 +1061,9 @@ mod separated_identifier_tests {
         let p = json::obj(vec![("v", json::Value::Str(text.to_string()))]);
         redact_text(&p)
     }
+    fn p(v: &str) -> json::Value {
+        json::obj(vec![("v", json::Value::Str(v.to_string()))])
+    }
 
     /// Regression: dashes split a phone into three short runs, so the contiguous
     /// digit scan never classified it and the number went out in clear text.
@@ -1091,5 +1098,29 @@ mod separated_identifier_tests {
         let out = redact("visit on 2020-05-15 for review");
         assert!(out.contains("[**DATE**]"), "{out}");
         assert!(!out.contains("[**SSN**]"), "{out}");
+    }
+
+    /// Regression (P1): bnd_ok_l/r used a single-byte slice, so a CJK char
+    /// directly adjacent to a number (手机号138…) put the slice boundary mid-char
+    /// and panicked -> SIGABRT the whole DuckDB process. These are the primary
+    /// Chinese-PHI redaction inputs and must not crash (pre-fix they did).
+    #[test]
+    fn cjk_adjacent_numbers_do_not_panic() {
+        // left neighbor CJK, right neighbor CJK
+        let out = redact("手机号13812345678谢谢");
+        assert!(out.contains("[**PHONE**]"), "{out}");
+        // right neighbor CJK only (digit run ends at string/CJK boundary)
+        let out = redact("联系电话13912345678");
+        assert!(out.contains("[**PHONE**]"), "{out}");
+    }
+
+    /// USCC is a redact_secrets rule (not redact_text) and shares bnd_ok_l/r,
+    /// so a USCC adjacent to CJK on both sides used to panic too. Must not.
+    #[test]
+    fn cjk_adjacent_uscc_does_not_panic() {
+        // 91350100M000100T4Y: check digit Y passes uscc_ok (GB 32100-2015)
+        let out = redact_secrets(&p("信用代码91350100M000100T4Y公司"));
+        let v = json::decode(&out).unwrap();
+        assert!(v.get_s("text").unwrap().contains("[**USCC**]"), "{out}");
     }
 }

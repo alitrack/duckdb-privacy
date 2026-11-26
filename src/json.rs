@@ -331,13 +331,28 @@ fn parse_string(s: &str, bytes: &[u8], pos: &mut usize) -> Result<String, String
             return Ok(out);
         }
         if c == b'\\' {
+            // truncated escape: `*pos+1` runs past the buffer when the string
+            // ends right on a backslash (was an unchecked OOB -> process abort).
+            if *pos + 1 >= bytes.len() {
+                return Err(format!("truncated escape at pos {}", pos));
+            }
             let n = bytes[*pos + 1];
             match n {
                 b'u' => {
+                    // truncated \uXXXX: need 4 hex digits after \u
+                    if *pos + 6 > s.len() {
+                        return Err(format!("truncated \\u at pos {}", pos));
+                    }
                     let hex = &s[*pos + 2..*pos + 6];
                     let cp = u32::from_str_radix(hex, 16).map_err(|_| format!("bad \\u at pos {}", pos))?;
                     push_char(&mut out, cp);
+                    // \uXXXX is 6 chars; advance past all of it and skip the
+                    // shared `*pos += 2` at the end of the match (the 2-char
+                    // escapes fall through to that one). Without `continue` the
+                    // escape consumed 8 bytes and a valid \uXXXX became an
+                    // "unterminated string" error.
                     *pos += 6;
+                    continue;
                 }
                 b'"' => out.push('"'),
                 b'\\' => out.push('\\'),
@@ -477,5 +492,38 @@ mod fmt_g_tests {
     fn tiny_values_switch_to_exponent() {
         assert_eq!(fmt_g(0.00001), "1e-05");
         assert_eq!(fmt_g(0.000001), "1e-06");
+    }
+}
+
+#[cfg(test)]
+mod truncated_escape_tests {
+    use super::decode;
+
+    /// Regression (P1): parse_string read `*pos+1` / `*pos+2..*pos+6` with no
+    /// bounds check, so a string whose value ends right on a backslash (or a
+    /// \u with fewer than 4 hex digits) indexed past the buffer and panicked
+    /// -> SIGABRT the whole DuckDB process. These must return Err (→ NULL via
+    /// dispatch), never panic. Inputs below are the raw JSON text to decode.
+    #[test]
+    fn backslash_at_eof_is_error_not_panic() {
+        // value `abc\` with the backslash as the final byte of the buffer
+        assert!(decode("{\"v\":\"abc\\").is_err());
+    }
+
+    #[test]
+    fn truncated_unicode_escape_is_error_not_panic() {
+        // `a\u0` leaves only 1 hex digit before the closing quote: *pos+6 runs
+        // past the buffer (pre-fix: slice OOB -> panic). r## keeps `\u` literal.
+        assert!(decode(r##"{"v":"a\u0"}"##).is_err());
+        // zero hex digits after \u
+        assert!(decode(r##"{"v":"a\u"}"##).is_err());
+    }
+
+    #[test]
+    fn valid_escapes_still_parse() {
+        let v = decode(r##"{"v":"a\nb\tc"}"##).unwrap();
+        assert_eq!(v.get_s("v").unwrap(), "a\nb\tc");
+        let v = decode(r##"{"v":"\u00e9"}"##).unwrap();
+        assert_eq!(v.get_s("v").unwrap(), "\u{e9}");
     }
 }
