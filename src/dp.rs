@@ -129,7 +129,11 @@ pub fn laplace_draw(rng: &mut Rng, scale: f64) -> String {
 /// negative) for δ >= 1; out-of-domain input must not reach the arithmetic or
 /// it emits `NaN`/`inf` tokens that are not valid JSON.
 fn delta_ok(d: f64) -> bool {
-    d.is_finite() && d > 0.0 && d < 1.0
+    // (1.0 / d) must stay finite: a denormal-scale d (e.g. 1e-320) passes
+    // `0 < d < 1` but `1.0 / d` overflows to inf, and the bound's
+    // `(1.0 / delta).ln()` would then emit an `inf` token. Real DP deltas
+    // (1e-5..1e-12) are far from this.
+    d.is_finite() && d > 0.0 && d < 1.0 && (1.0 / d).is_finite()
 }
 
 /// An epsilon the composition bound can accept: finite, non-negative, and
@@ -146,7 +150,12 @@ fn epsilon_ok(e: f64) -> bool {
 fn advanced_epsilon(list: &[f64], delta: f64) -> f64 {
     let s1: f64 = list.iter().map(|e| e * (e.exp() - 1.0)).sum();
     let s2: f64 = list.iter().map(|e| e * e).sum();
-    s1 + (2.0 * (1.0 / delta).ln() * s2).sqrt()
+    let adv = s1 + (2.0 * (1.0 / delta).ln() * s2).sqrt();
+    // Even with delta/epsilon gated, the SUMS can overflow f64 (many large
+    // epsilons, or a tiny delta). Return one well-defined non-finite sentinel
+    // (INFINITY, never NaN) so callers can detect and reject it instead of
+    // emitting a non-JSON `inf`/`NaN` token.
+    if adv.is_finite() { adv } else { f64::INFINITY }
 }
 
 fn list_sum(list: &[f64]) -> f64 {
@@ -211,7 +220,19 @@ pub fn dp_compose(p: &Value) -> String {
         )]));
     }
     let basic = list_sum(&list);
+    if !basic.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("epsilon total overflowed (invalid for a privacy budget)".into()),
+        )]));
+    }
     let adv = advanced_epsilon(&list, delta);
+    if !adv.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("advanced composition overflowed (epsilon count too large / delta too small)".into()),
+        )]));
+    }
     let saving = if basic > 0.0 { adv / basic } else { 0.0 };
     format!(
         "{{\"n\":{},\"delta\":{},\"basic_total\":{:.9},\"advanced_total\":{:.9},\"saving_ratio\":{:.4}}}",
@@ -226,6 +247,12 @@ pub fn dp_compose(p: &Value) -> String {
 /// op='dp_alloc' → JSON budget allocation record.
 pub fn dp_alloc(p: &Value) -> String {
     let budget = f_opt(p, "budget").unwrap_or(1.0);
+    if !budget.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("budget must be finite".into()),
+        )]));
+    }
     let n = f_opt(p, "n").map(|x| x as i64).unwrap_or(0);
     if n <= 0 {
         return json::encode(&json::obj(vec![(
@@ -268,16 +295,34 @@ pub fn dp_alloc(p: &Value) -> String {
     let adv_per = lo;
 
     let per = if comp == "advanced" || comp == "auto" { adv_per } else { basic_per };
+    // An inf budget or an extreme delta can drive the per-query value to
+    // inf/NaN; reject that rather than emitting a non-JSON token.
+    if !per.is_finite() || !adv_per.is_finite() || !basic_per.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("per-query allocation overflowed (budget/delta out of range)".into()),
+        )]));
+    }
     let best = if adv_per > basic_per { "advanced" } else { "basic" };
     let rec = if best == "advanced" { adv_per } else { basic_per };
 
     let bound_of = |x: f64| -> f64 {
-        if (x - basic_per).abs() < 1e-15 {
+        let b = if (x - basic_per).abs() < 1e-15 {
             x * n as f64
         } else {
             advanced_epsilon(&vec![x; n as usize], delta)
-        }
+        };
+        if b.is_finite() { b } else { f64::INFINITY }
     };
+    let total_bound = bound_of(per);
+    let advanced_total = bound_of(adv_per);
+    let basic_total = basic_per * n as f64;
+    if !total_bound.is_finite() || !advanced_total.is_finite() || !basic_total.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("total budget bound overflowed (out of range)".into()),
+        )]));
+    }
     format!(
         "{{\"budget\":{},\"n\":{},\"delta\":{},\"requested_composition\":\"{}\",\
          \"per_query\":{:.9},\"total_bound\":{:.9},\"basic_per\":{:.9},\"advanced_per\":{:.9},\
@@ -301,6 +346,12 @@ pub fn dp_alloc(p: &Value) -> String {
 pub fn dp_budget(p: &Value) -> String {
     let budget = f_opt(p, "budget").unwrap_or(1.0);
     let request = f_opt(p, "request").unwrap_or(0.0);
+    if !budget.is_finite() || !request.is_finite() {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("budget and request must be finite".into()),
+        )]));
+    }
     let delta = f_opt(p, "delta").unwrap_or(1e-5);
     let comp = p.get_s("composition").unwrap_or("basic").to_string();
     let mut list: Vec<f64> = Vec::new();
@@ -339,6 +390,12 @@ pub fn dp_budget(p: &Value) -> String {
         let mut l2 = list.clone();
         l2.push(request);
         tot_after = advanced_epsilon(&l2, delta);
+        if !tot_before.is_finite() || !tot_after.is_finite() {
+            return json::encode(&json::obj(vec![(
+                "error",
+                Value::Str("advanced composition overflowed (ledger too large / delta too small)".into()),
+            )]));
+        }
     }
     let allow = tot_after <= budget + 1e-12;
     format!(
@@ -490,6 +547,44 @@ mod tests {
             ("delta", json::Value::Num(5.0)),
         ]));
         assert!(b.contains("\"error\""), "budget delta=5 gave {b}");
+    }
+
+    /// Regression (MUST-FIX-2, 4th re-review): extreme-but-finite input still
+    /// made the composition bound emit `inf`/`NaN` (invalid JSON) through three
+    /// paths. None of them may produce a non-finite token anymore.
+    #[test]
+    fn compose_no_infnan_extreme() {
+        // (a) delta tiny enough that 1/delta overflows (passes 0<d<1).
+        let tiny = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(1.0)),
+            ("delta", json::Value::Num(1e-320)),
+        ]));
+        assert!(tiny.contains("\"error\""), "tiny delta gave {tiny}");
+        assert!(!tiny.contains("inf") && !tiny.contains("NaN"), "leak: {tiny}");
+        // (b) each epsilon < 700, but the sum over a million of them overflows.
+        let big = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(699.0)),
+            ("count", json::Value::Num(1_000_000.0)),
+        ]));
+        assert!(big.contains("\"error\""), "big eps*count gave {big}");
+        assert!(!big.contains("inf") && !big.contains("NaN"), "leak: {big}");
+    }
+
+    /// (c) budget / request that parse to inf (e.g. 1e309) must be rejected.
+    #[test]
+    fn alloc_budget_reject_infinite_budget() {
+        let a = dp_alloc(&json::obj(vec![
+            ("budget", json::Value::Num(f64::INFINITY)),
+            ("n", json::Value::Num(5.0)),
+        ]));
+        assert!(a.contains("\"error\""), "inf budget gave {a}");
+        assert!(!a.contains("inf") && !a.contains("NaN"), "leak: {a}");
+        let b = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(f64::INFINITY)),
+            ("request", json::Value::Num(1.0)),
+            ("composition", json::Value::Str("advanced".into())),
+        ]));
+        assert!(b.contains("\"error\""), "inf budget gave {b}");
     }
 
 }

@@ -222,7 +222,11 @@ fn generalize_group(g: &[Rec]) -> Vec<(String, String)> {
             let hi = qi_max(g, &f);
             out.push((f, format!("[{},{}]", json::fmt_g(lo), json::fmt_g(hi))));
         } else {
-            let strs: Vec<String> = g.iter().map(|r| json::to_str_lossy(r.qi_get(&f).unwrap())).collect();
+            // A ragged qi (parallel arrays of different lengths, or records with
+            // different keys) can leave a record missing a field that g[0] has; map
+            // the absent value to the empty string rather than unwrapping (which
+            // panicked and aborted the whole process).
+            let strs: Vec<String> = g.iter().map(|r| r.qi_get(&f).map(json::to_str_lossy).unwrap_or_default()).collect();
             let pref = common_prefix(&strs);
             out.push((f, if pref.is_empty() { "*".into() } else { pref }));
         }
@@ -454,7 +458,8 @@ fn group_ila(g: &[Rec], spans: &HashMap<String, (f64, f64)>) -> f64 {
         } else {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for r in g {
-                seen.insert(json::to_str_lossy(r.qi_get(f).unwrap()));
+                // same ragged-qi guard as generalize_group: missing field -> ""
+                seen.insert(r.qi_get(f).map(json::to_str_lossy).unwrap_or_default());
             }
             let cnt = seen.len();
             sum += if cnt > 0 { 1.0 - 1.0 / cnt as f64 } else { 0.0 };
@@ -706,5 +711,34 @@ mod tests {
         let rep = v.get("report").unwrap();
         assert!(out.contains("\"verdict\":\"pass\"") || out.contains("\"verdict\":\"fail\""));
         assert!(rep.get("k_ok").is_some(), "k_ok field present in report");
+    }
+
+    /// Regression (MUST-FIX-1, 4th re-review): the parallel-array form builds
+    /// `n = max array length` records, so shorter arrays leave later records
+    /// missing a field that g[0] has. generalize_group used to `qi_get(f)
+    /// .unwrap()` on the missing field and panic (SIGABRT). It must now treat
+    /// the missing field as the empty string and return a valid report.
+    #[test]
+    fn kanon_ragged_parallel_arrays() {
+        // age has 4 values, city has 2 -> records 2 and 3 have no city.
+        let p = json::decode(r#"{"k":5,"age":[25,26,90,91],"city":["hz","sh"]}"#).unwrap();
+        let out = kanon(&p);
+        let v = json::decode(&out).unwrap();
+        assert!(v.get("groups").is_some(), "groups present: {out}");
+        assert!(!out.contains("\"error\""), "no error for ragged input: {out}");
+    }
+
+    /// Records form with differing qi keys (record 3 has no city) is the same
+    /// class of ragged input; must also not panic.
+    #[test]
+    fn kanon_ragged_records_keys() {
+        let p = json::decode(r#"{"k":5,"records":[
+            {"id":1,"qi":{"age":25,"city":"hz"}},
+            {"id":2,"qi":{"age":26,"city":"sh"}},
+            {"id":3,"qi":{"age":90}},
+            {"id":4,"qi":{"age":91}}]}"#).unwrap();
+        let out = kanon(&p);
+        let v = json::decode(&out).unwrap();
+        assert!(v.get("groups").is_some(), "groups present: {out}");
     }
 }
