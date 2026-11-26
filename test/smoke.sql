@@ -27,6 +27,10 @@ SELECT dp_alloc('t1', 'b', 0.6, 0.5) IS NOT NULL AS alloc_b;
 -- 0.5 + 0.6 = 1.1 > 0.5 budget: still recorded (audit), flagged over_budget
 SELECT (dp_budget('t1') ->> 'total')::DOUBLE > 1.0 AS budget_overspent;
 SELECT (dp_budget('t1') ->> 'entries')::INT = 2 AS ledger_entries;
+-- dp_compose natural call shape (no "op" field): previously the named function
+-- reused the dispatcher, which defaulted to "mask" and returned empty. It now
+-- calls dp_compose directly, so the epsilon field is honoured.
+SELECT dp_compose('{"epsilon":0.5}') LIKE '%basic_total%' AS dp_compose_natural;
 
 -- ── mask: mode-based (Lua-compatible) ──
 SELECT mask('13812345678') = '1*********8' AS mask_star_default;
@@ -101,6 +105,11 @@ SELECT privacy('not json') IS NULL AS bad_json_is_null;
 -- Truncated escape: a JSON string that ends on a backslash / has a short \u
 -- used to index past the buffer (-> SIGABRT). Must be NULL, not a crash.
 SELECT privacy('{"v":"abc\') IS NULL AS truncated_escape_is_null;
+-- Re-review P1: an unterminated object with a trailing comma (or a lone '{')
+-- reached parse_string's entry at *pos == len() and indexed past the buffer
+-- (-> SIGABRT). Must be NULL, not a crash.
+SELECT privacy('{"v":"x",') IS NULL AS trailing_comma_object_is_null;
+SELECT privacy('{') IS NULL AS lone_brace_is_null;
 SELECT privacy('{"op":"mask","v":"13812345678","kind":"phone"}') = '138****5678'
   AS dispatcher_respects_kind;
 

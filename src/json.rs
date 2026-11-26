@@ -319,7 +319,13 @@ fn parse_value(s: &str, bytes: &[u8], pos: &mut usize) -> Result<Value, String> 
 }
 
 fn parse_string(s: &str, bytes: &[u8], pos: &mut usize) -> Result<String, String> {
-    if bytes[*pos] != b'"' {
+    // Entry guard: the object-key path (parse_value `b'{'`) and the top-level
+    // path both reach here after a `skip_ws` that can land at `*pos == len()`.
+    // An unterminated object followed by a trailing comma (`{"v":"x",`) or a
+    // lone `{` did so, and `bytes[*pos]` indexed past the buffer -> OOB panic
+    // -> SIGABRT the whole process (the same class of client-triggerable DoS
+    // the escape-branch check below closes; the dispatcher only catches Err).
+    if *pos >= s.len() || bytes[*pos] != b'"' {
         return Err(format!("expected string at pos {}", pos));
     }
     *pos += 1;
@@ -517,6 +523,25 @@ mod truncated_escape_tests {
         assert!(decode(r##"{"v":"a\u0"}"##).is_err());
         // zero hex digits after \u
         assert!(decode(r##"{"v":"a\u"}"##).is_err());
+    }
+
+    /// Re-review P1: the parse_string *entry* (`bytes[*pos] != b'"'`) had no
+    /// bounds check, and the object-key path reaches it right after a
+    /// skip_ws that can land at `*pos == len()`. An unclosed object followed
+    /// by a trailing comma (`{"v":"x",`) or a lone `{` indexed past the
+    /// buffer -> OOB panic -> SIGABRT. The dispatcher only catches Err, so
+    /// these must return Err (-> NULL), never panic.
+    #[test]
+    fn unterminated_object_with_trailing_comma_is_error_not_panic() {
+        // `{"a":1,` — the key parse at the comma lands at EOF (len 7, idx 7)
+        assert!(decode("{\"a\":1,").is_err());
+        // `{"v":"x",` — value present, trailing comma, no second key
+        assert!(decode("{\"v\":\"x\",").is_err());
+        // lone `{` — empty object not detected (next char is EOF), key parse
+        // at EOF
+        assert!(decode("{").is_err());
+        // whitespace before the closing-EOF key
+        assert!(decode("{\"a\":1, ").is_err());
     }
 
     #[test]

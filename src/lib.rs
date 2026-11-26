@@ -170,6 +170,40 @@ unsafe extern "C" fn fn_privacy(
     }
 }
 
+/// dp_compose — dedicated callback. The named function previously reused the
+/// generic dispatcher (`fn_privacy`), which routes on the JSON `op` field and
+/// defaults to `"mask"` when it is absent — so `dp_compose('{"epsilon":…}')`
+/// silently ran `mask` and returned empty, contradicting the README's named-
+/// function contract. This decodes the JSON and calls `dp::dp_compose` directly
+/// (it reads `delta`/`epsilon`/`epsilons`, not `op`), so the natural call shape
+/// works; bad JSON / non-object → NULL, matching the dispatcher's contract.
+unsafe extern "C" fn fn_dp_compose(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = rows(input);
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        let Some(raw) = col_str(input, 0, i) else {
+            unsafe { out.set_null(i) };
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        match json::decode(trimmed) {
+            Ok(v) if v.is_obj() => {
+                let res = dp::dp_compose(&v);
+                unsafe { out.write_str(i, &res) }
+            }
+            _ => unsafe { out.set_null(i) },
+        }
+    }
+}
+
 /// One string in, one string out, wrapped as `{"v": value}`.
 fn unary(input: duckdb_data_chunk, output: duckdb_vector, f: fn(&json::Value) -> String) {
     let n = rows(input);
@@ -689,12 +723,14 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                         .volatile()
                         .function(fn_laplace2),
                 )?;
-        // dp_compose takes the JSON form straight through the dispatcher.
+        // dp_compose has a dedicated callback so the natural call shape
+        // dp_compose('{"epsilon":…}') works without an explicit "op" field —
+        // the dispatcher (fn_privacy) would otherwise default to "mask".
         reg.register_scalar(
             ScalarFunctionBuilder::new("dp_compose")
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
-                .function(fn_privacy),
+                .function(fn_dp_compose),
         )?;
         reg.register_scalar(
             ScalarFunctionBuilder::new("dp_alloc")
