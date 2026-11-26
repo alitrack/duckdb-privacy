@@ -28,12 +28,17 @@ use crate::mask::{f_opt, generic_star, is_compound_surname, s};
 
 fn base(v: &str, head: usize, tail: usize) -> String {
     let chars: Vec<char> = v.chars().collect();
-    if chars.len() <= head + tail {
-        return "*".repeat(chars.len());
+    // Clamp: head/tail come from a client f64 `as usize` and can be
+    // usize::MAX (1e300), which would break the guard and OOB the slices.
+    let n = chars.len();
+    let head = head.min(n);
+    let tail = tail.min(n);
+    if n <= head + tail {
+        return "*".repeat(n);
     }
     let h: String = chars[..head].iter().collect();
-    let t: String = chars[chars.len() - tail..].iter().collect();
-    format!("{}{}{}", h, "*".repeat(chars.len() - head - tail), t)
+    let t: String = chars[n - tail..].iter().collect();
+    format!("{}{}{}", h, "*".repeat(n - head - tail), t)
 }
 
 fn is_digits(v: &str) -> bool {

@@ -48,12 +48,18 @@ pub fn hex2bytes(h: &str) -> Result<Vec<u8>, String> {
 // ── core FF3 / FF3-1 ───────────────────────────────────────────────
 /// Clean FF3/FF3-1 transform with explicit (a, b) locals.
 pub fn ff3_transform(key: &[u8], tw8: &[u8; 8], alpha: &str, s: &str, enc: bool, _ff31: bool) -> Result<String, String> {
-    let base = alpha.len() as u128;
-    let n = s.len();
+    // base and the a/b split must use CHAR semantics so they line up with
+    // alpha_chars (a char list) and the char split below. Using byte lengths
+    // (alpha.len() / s.len()) let a non-ASCII custom alphabet (e.g. "\u4f60\u597d")
+    // make base (bytes) exceed the number of alphabet chars, so the encode
+    // loop's alpha_chars[rem] indexed past the end -> SIGABRT.
+    let alpha_chars: Vec<char> = alpha.chars().collect();
+    let base = alpha_chars.len() as u128;
+    let s_chars: Vec<char> = s.chars().collect();
+    let n = s_chars.len();
     let u = (n + 1) / 2;
     let v = n - u;
 
-    let alpha_chars: Vec<char> = alpha.chars().collect();
     let mut char_idx: std::collections::HashMap<char, u64> = std::collections::HashMap::new();
     for (i, c) in alpha_chars.iter().enumerate() {
         char_idx.insert(*c, i as u64);
@@ -70,10 +76,10 @@ pub fn ff3_transform(key: &[u8], tw8: &[u8; 8], alpha: &str, s: &str, enc: bool,
         Ok(x)
     };
 
-    let a_str = s.get(..u).ok_or("slice")?;
-    let b_str = s.get(u..).ok_or("slice")?;
-    let mut a = decode(a_str)?;
-    let mut b = decode(b_str)?;
+    let a_str: String = s_chars[..u].iter().collect();
+    let b_str: String = s_chars[u..].iter().collect();
+    let mut a = decode(&a_str)?;
+    let mut b = decode(&b_str)?;
 
     let mut mu: u128 = 1;
     for _ in 0..u {
@@ -262,9 +268,10 @@ fn fpe_run(o: &FpeOpts, enc: bool) -> Result<String, String> {
         let t = &o.tweak;
         [t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]
     };
-    // length gate (mirror ff3_core's domain checks)
-    let base = o.alpha.len() as u128;
-    let n = o.v.len();
+    // length gate (mirror ff3_core's domain checks) -- char-based, matching
+    // ff3_transform, so a non-ASCII alphabet's domain is measured in chars.
+    let base = o.alpha.chars().count() as u128;
+    let n = o.v.chars().count();
     if n < 2 {
         return Err("fpe: length < 2".into());
     }

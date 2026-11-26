@@ -240,7 +240,9 @@ pub fn kanon(p: &Value) -> String {
         Ok(r) => r,
         Err(e) => return json::encode(&json::obj(vec![("error", Value::Str(e))])),
     };
-    let k = f_opt(p, "k").map(|x| x as i64).unwrap_or(2);
+    // k is clamped to [1, 1e6]: 1e30 saturates `as i64` to i64::MAX, and the
+    // `2 * k` arithmetic in kanon_core would overflow (debug: panic).
+    let k = f_opt(p, "k").map(|x| x as i64).unwrap_or(2).clamp(1, 1_000_000);
     let groups = kanon_core(&mut records, k);
     let mut suppressed = 0i64;
     let mut out_groups = Vec::new();
@@ -338,8 +340,10 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     let mut numeric = true;
     for k in dg.keys() {
         match k.parse::<f64>() {
-            Ok(x) => u.push(x),
-            Err(_) => {
+            // f64 parsing accepts "NaN"/"inf"; reject non-finite so the
+            // support set (and the EMD) stays finite.
+            Ok(x) if x.is_finite() => u.push(x),
+            _ => {
                 numeric = false;
                 break;
             }
@@ -348,8 +352,8 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     if numeric {
         for k in dq.keys() {
             match k.parse::<f64>() {
-                Ok(x) => u.push(x),
-                Err(_) => {
+                Ok(x) if x.is_finite() => u.push(x),
+                _ => {
                     numeric = false;
                     break;
                 }
@@ -371,14 +375,14 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     // accumulated keys, so the binary search below always lands.
     let mut num_g: Vec<(f64, i64)> = dg
         .iter()
-        .filter_map(|(k, c)| k.parse::<f64>().ok().map(|x| (x, *c)))
+        .filter_map(|(k, c)| k.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| (x, *c)))
         .collect();
     let mut num_q: Vec<(f64, i64)> = dq
         .iter()
-        .filter_map(|(k, c)| k.parse::<f64>().ok().map(|x| (x, *c)))
+        .filter_map(|(k, c)| k.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| (x, *c)))
         .collect();
-    num_g.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    num_q.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    num_g.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    num_q.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let merge = |v: &mut Vec<(f64, i64)>| {
         v.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-15);
         let mut out: Vec<(f64, i64)> = Vec::with_capacity(v.len());
@@ -393,12 +397,12 @@ fn emd_1d(dg: &HashMap<String, i64>, ng: i64, dq: &HashMap<String, i64>, nq: i64
     merge(&mut num_g);
     merge(&mut num_q);
     let count_at = |v: &[(f64, i64)], x: f64| -> i64 {
-        match v.binary_search_by(|e| e.0.partial_cmp(&x).unwrap()) {
+        match v.binary_search_by(|e| e.0.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal)) {
             Ok(i) => v[i].1,
             Err(_) => 0,
         }
     };
-    u.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    u.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     u.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     let span = u[u.len() - 1] - u[0];
     if span <= 0.0 {
@@ -465,7 +469,7 @@ pub fn kanon_report(p: &Value) -> String {
         Ok(r) => r,
         Err(e) => return json::encode(&json::obj(vec![("error", Value::Str(e))])),
     };
-    let k = f_opt(p, "k").map(|x| x as i64).unwrap_or(2);
+    let k = f_opt(p, "k").map(|x| x as i64).unwrap_or(2).clamp(1, 1_000_000);
     let groups = kanon_core(&mut records, k);
     let n = records.len() as i64;
     let l_req = f_opt(p, "l").unwrap_or(2.0);

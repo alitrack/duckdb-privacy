@@ -31,6 +31,15 @@ SELECT (dp_budget('t1') ->> 'entries')::INT = 2 AS ledger_entries;
 -- reused the dispatcher, which defaulted to "mask" and returned empty. It now
 -- calls dp_compose directly, so the epsilon field is honoured.
 SELECT dp_compose('{"epsilon":0.5}') LIKE '%basic_total%' AS dp_compose_natural;
+-- Re-review P3-2: an out-of-domain epsilon (e.exp() overflow) or delta outside
+-- (0,1) (ln(1/delta) diverges / sqrt of a negative) used to emit inf/NaN
+-- tokens that are not valid JSON. They must now be a structured error.
+SELECT dp_compose('{"epsilon":1000}') LIKE '%error%' AS dp_compose_huge_eps_err;
+SELECT dp_compose('{"epsilon":0.5,"delta":0}') LIKE '%error%' AS dp_compose_delta0_err;
+-- Re-review P1-4: a 10-byte count/n field (1e19) used to saturate to i64::MAX
+-- and trigger a capacity-overflow abort. Capped -> structured error.
+SELECT dp_compose('{"epsilon":0.5,"count":1e19}') LIKE '%error%' AS dp_compose_count_capped;
+SELECT privacy('{"op":"dp_alloc","n":1e19,"budget":1}') LIKE '%error%' AS dp_alloc_n_capped;
 
 -- ── mask: mode-based (Lua-compatible) ──
 SELECT mask('13812345678') = '1*********8' AS mask_star_default;
@@ -81,6 +90,29 @@ SELECT redact_text('联系电话13912345678') LIKE '%[**PHONE**]%' AS redact_cjk
 -- ── FPE: key is mandatory (an all-zero key would be no encryption) ──
 SELECT fpe_encode('1234567890123456', 'key12345678901', '00000000000000')
   LIKE '%key%' AS fpe_rejects_bad_key;
+-- Re-review P1-1: a non-ASCII custom alphabet made `base`/`n` use byte length
+-- (more than the char count), so the FF3 encode loop indexed alpha_chars past
+-- the end and panicked -> SIGABRT. It must not crash: a tiny radix^n is
+-- rejected as a structured error, a large one round-trips.
+SELECT privacy('{"op":"fpe_encode","v":"你好你好","key":"0123456789abcdef0123456789abcdef","alphabet":"你好"}')
+  LIKE '%error%' AS fpe_nonascii_tiny_err;
+SELECT (privacy('{"op":"fpe_decode","v":"六二九二十九十八四五","key":"0123456789abcdef0123456789abcdef","tweak":"00000000000000","alphabet":"一二三四五六七八九十"}')
+  ->> 'value') = '一二三四五六七八九十' AS fpe_nonascii_roundtrip;
+-- Re-review P1-2: mask_cn byte-offset slicing on a non-ASCII value of the same
+-- byte length put a cut mid-character and panicked -> SIGABRT. It must mask
+-- (fall back to generic starring), not crash.
+SELECT mask_cn('🀀🀀🀀🀀é', 'idcard') IS NOT NULL AS mask_cn_nonascii_idcard;
+SELECT mask_cn('🀀🀀你', 'mobile') IS NOT NULL AS mask_cn_nonascii_mobile;
+-- Re-review P1-3: a caller head/tail of 1e300 saturated `as usize` to
+-- usize::MAX, which broke the guard and OOB'd the slice -> SIGABRT. The star
+-- modes must clamp, not crash.
+SELECT privacy('{"op":"mask","mode":"star","v":"abc","head":1e300,"tail":1}') IS NOT NULL AS star_head_tail_capped;
+SELECT privacy('{"op":"mask_kind","v":"abc","head":1e300,"tail":1}') IS NOT NULL AS mask_kind_head_tail_capped;
+-- Re-review P1-5: an ordered kanon_report whose sensitive values parse to NaN
+-- made emd_1d's partial_cmp().unwrap() panic -> SIGABRT. Non-finite values are
+-- now rejected (the report still returns, as a structured value).
+SELECT privacy('{"op":"kanon_report","ordered":true,"k":2,"records":[{"id":1,"qi":{"age":1},"sens":"NaN"},{"id":2,"qi":{"age":2},"sens":"NaN"},{"id":3,"qi":{"age":3},"sens":"1"}]}')
+  IS NOT NULL AS kanon_report_nan_sens;
 
 CREATE TEMP TABLE fpe AS SELECT
   fpe_encode('1234567890123456', '0123456789abcdef0123456789abcdef', '00000000000000') AS enc;

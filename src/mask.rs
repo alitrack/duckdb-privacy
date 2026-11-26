@@ -14,6 +14,11 @@ fn f(v: &Value, k: &str) -> f64 {
 pub(crate) fn f_opt(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(json::to_f64)
 }
+/// All-ASCII-digit check -- the byte-slicing mask branches (idcard/mobile/
+/// bankcard) are only safe when every char is a single ASCII byte.
+pub(crate) fn is_ascii_digits(v: &str) -> bool {
+    !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())
+}
 
 // ── generic mask (op='mask') ───────────────────────────────────────
 
@@ -31,12 +36,18 @@ pub fn mask(p: &Value) -> String {
             let head = f_opt(p, "head").unwrap_or(1.0) as usize;
             let tail = f_opt(p, "tail").unwrap_or(1.0) as usize;
             let chars: Vec<char> = v.chars().collect();
-            if chars.len() <= head + tail {
-                "*".repeat(chars.len())
+            // A caller-supplied head/tail of 1e300 saturates `as usize` to
+            // usize::MAX; clamping to the string length keeps the
+            // `chars[..head]` slices and the `head + tail` guard safe.
+            let n = chars.len();
+            let head = head.min(n);
+            let tail = tail.min(n);
+            if n <= head + tail {
+                "*".repeat(n)
             } else {
                 let head_s: String = chars[..head].iter().collect();
-                let tail_s: String = chars[chars.len() - tail..].iter().collect();
-                format!("{}{}{}", head_s, "*".repeat(chars.len() - head - tail), tail_s)
+                let tail_s: String = chars[n - tail..].iter().collect();
+                format!("{}{}{}", head_s, "*".repeat(n - head - tail), tail_s)
             }
         }
         "bin" => {
@@ -46,7 +57,9 @@ pub fn mask(p: &Value) -> String {
             };
             let lo = f_opt(p, "lo").unwrap_or(0.0);
             let mut hi = f_opt(p, "hi").unwrap_or(100.0);
-            let bins = f_opt(p, "bins").unwrap_or(5.0) as usize;
+            // bins is clamped to [1, 1e6]: 0 would underflow `(bins - 1)`, and
+            // 1e300 saturates `as usize` to usize::MAX (wrong bin width).
+            let bins = (f_opt(p, "bins").unwrap_or(5.0) as usize).clamp(1, 1_000_000);
             if hi <= lo {
                 hi = lo + 1.0;
             }
@@ -91,12 +104,17 @@ pub(crate) fn generic_star(v: &str, head: Option<usize>, tail: Option<usize>) ->
     let head = head.unwrap_or(1);
     let tail = tail.unwrap_or(1);
     let chars: Vec<char> = v.chars().collect();
-    if chars.len() <= head + tail {
-        return "*".repeat(chars.len());
+    // Clamp head/tail to the string length: a client value of 1e300 saturates
+    // `as usize` to usize::MAX, which would break the guard and OOB the slices.
+    let n = chars.len();
+    let head = head.min(n);
+    let tail = tail.min(n);
+    if n <= head + tail {
+        return "*".repeat(n);
     }
     let head_s: String = chars[..head].iter().collect();
-    let tail_s: String = chars[chars.len() - tail..].iter().collect();
-    format!("{}{}{}", head_s, "*".repeat(chars.len() - head - tail), tail_s)
+    let tail_s: String = chars[n - tail..].iter().collect();
+    format!("{}{}{}", head_s, "*".repeat(n - head - tail), tail_s)
 }
 
 /// Value auto-detection (kind='auto').
@@ -150,11 +168,30 @@ pub fn mask_cn(p: &Value) -> String {
     // hash mode: rule prefix + fingerprint (deterministic → join key)
     if mode == "hash" {
         return match kind.as_str() {
+            // Byte-offset slicing is only safe on all-ASCII-digit input; a
+            // non-ASCII value of the same byte length would put an offset
+            // mid-character and panic. Guard, else fall to generic_star.
             "idcard" if v.len() == 18 || v.len() == 15 => {
-                format!("{}#{}", &v[..6], fp)
+                if is_ascii_digits(&v) {
+                    format!("{}#{}", &v[..6], fp)
+                } else {
+                    format!("{}#{}", generic_star(&v, None, None), fp)
+                }
             }
-            "bankcard" if (16..=19).contains(&v.len()) => format!("{}#{}", &v[..6], fp),
-            "mobile" if v.len() == 11 => format!("{}#{}", &v[..3], fp),
+            "bankcard" if (16..=19).contains(&v.len()) => {
+                if is_ascii_digits(&v) {
+                    format!("{}#{}", &v[..6], fp)
+                } else {
+                    format!("{}#{}", generic_star(&v, None, None), fp)
+                }
+            }
+            "mobile" if v.len() == 11 => {
+                if is_ascii_digits(&v) {
+                    format!("{}#{}", &v[..3], fp)
+                } else {
+                    format!("{}#{}", generic_star(&v, None, None), fp)
+                }
+            }
             "name" => {
                 let chars: Vec<char> = v.chars().collect();
                 let first2: String = chars.iter().take(2).collect();
@@ -170,8 +207,10 @@ pub fn mask_cn(p: &Value) -> String {
                 format!("{}#{}", head, fp)
             }
             "email" => {
+                // `&v[..1]` is a char boundary only when the first char is a
+                // single-byte (ASCII) char.
                 if let Some(at) = v.find('@') {
-                    if at > 0 {
+                    if at > 0 && v.bytes().next().map_or(false, |b| b < 128) {
                         return format!("{}#{}{}", &v[..1], fp, &v[at..]);
                     }
                 }
@@ -200,22 +239,25 @@ pub fn mask_cn(p: &Value) -> String {
                     }
                 }
             }
-            if v.len() == 18 {
+            // Byte-offset slicing is only safe on all-ASCII input; a non-ASCII
+            // value of the same byte length would put an offset mid-character
+            // and panic. Guard with is_ascii_digits, else fall to generic_star.
+            if v.len() == 18 && is_ascii_digits(&v) {
                 return format!("{}{}{}", &v[..6], "*".repeat(8), &v[14..]);
             }
-            if v.len() == 15 {
+            if v.len() == 15 && is_ascii_digits(&v) {
                 return format!("{}{}{}", &v[..6], "*".repeat(5), &v[11..]);
             }
             generic_star(&v, None, None)
         }
         "mobile" => {
-            if v.len() == 11 {
+            if v.len() == 11 && is_ascii_digits(&v) {
                 return format!("{}{}{}", &v[..3], "*".repeat(4), &v[7..]);
             }
             generic_star(&v, None, None)
         }
         "bankcard" => {
-            if (16..=19).contains(&v.len()) {
+            if (16..=19).contains(&v.len()) && is_ascii_digits(&v) {
                 return format!("{}{}{}", &v[..6], "*".repeat(v.len() - 10), &v[v.len() - 4..]);
             }
             generic_star(&v, None, None)
@@ -235,8 +277,10 @@ pub fn mask_cn(p: &Value) -> String {
             format!("{}{}", head, "*".repeat(chars.len() - keep))
         }
         "email" => {
+            // `&v[..1]` is a char boundary only when the first char is a
+            // single-byte (ASCII) char; otherwise fall to generic_star.
             if let Some(at) = v.find('@') {
-                if at > 0 {
+                if at > 0 && v.bytes().next().map_or(false, |b| b < 128) {
                     return format!("{}***{}", &v[..1], &v[at..]);
                 }
             }
@@ -384,6 +428,10 @@ pub fn key_offset(key: &str, salt: &str, days: i64) -> i64 {
     if days == 0 {
         return 0;
     }
+    // Cap so `2 * days + 1` cannot overflow i64: a caller-supplied 1e308
+    // saturates the `as i64` cast to i64::MAX, which would otherwise overflow
+    // the modulus (debug: panic; release: silent garbage).
+    let days = days.clamp(0, i64::MAX / 4);
     let h = fnv1a(key, salt);
     ((h as i64) % (2 * days + 1)) - days
 }

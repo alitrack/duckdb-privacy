@@ -124,7 +124,25 @@ pub fn laplace_draw(rng: &mut Rng, scale: f64) -> String {
 
 // ── composition / budget ledger ────────────────────────────────────
 
-/// Dwork-Roth advanced composition bound.
+/// A delta inside the Dwork-Roth domain: finite, 0 < δ < 1. The advanced
+/// bound uses ln(1/δ), which diverges at δ = 0 and is negative (-> sqrt of a
+/// negative) for δ >= 1; out-of-domain input must not reach the arithmetic or
+/// it emits `NaN`/`inf` tokens that are not valid JSON.
+fn delta_ok(d: f64) -> bool {
+    d.is_finite() && d > 0.0 && d < 1.0
+}
+
+/// An epsilon the composition bound can accept: finite, non-negative, and
+/// inside the exp-domain. The Dwork-Roth bound uses e.exp(), which overflows
+/// to inf above ~709.78 in f64; a `1e308` or `1000` would emit an `inf` token
+/// that is not valid JSON, so we reject anything >= 700 (a real per-query
+/// privacy parameter never comes close).
+fn epsilon_ok(e: f64) -> bool {
+    e.is_finite() && e >= 0.0 && e < 700.0
+}
+
+/// Dwork-Roth advanced composition bound. Callers must gate `delta` through
+/// [`delta_ok`] and the list through [`epsilon_ok`] first.
 fn advanced_epsilon(list: &[f64], delta: f64) -> f64 {
     let s1: f64 = list.iter().map(|e| e * (e.exp() - 1.0)).sum();
     let s2: f64 = list.iter().map(|e| e * e).sum();
@@ -134,6 +152,13 @@ fn advanced_epsilon(list: &[f64], delta: f64) -> f64 {
 fn list_sum(list: &[f64]) -> f64 {
     list.iter().sum()
 }
+
+/// Hard ceiling on per-query expansion. `count`/`n` come from a client f64
+/// `as i64` and a value like 1e19 saturates to i64::MAX; repeating that many
+/// times would request ~7e19 bytes and the allocator panics (capacity
+/// overflow) -> process abort. Capping keeps a 10-byte input from amplifying
+/// into an OOM.
+const MAX_QUERIES: i64 = 1_000_000;
 
 /// p.epsilon / p.epsilons / p.count → list of per-query epsilons.
 fn eps_list(p: &Value) -> Vec<f64> {
@@ -146,7 +171,7 @@ fn eps_list(p: &Value) -> Vec<f64> {
         }
     }
     let one = f_opt(p, "epsilon");
-    let cnt = f_opt(p, "count").map(|c| c as i64).unwrap_or(0);
+    let cnt = f_opt(p, "count").map(|c| (c as i64).clamp(0, MAX_QUERIES)).unwrap_or(0);
     if let Some(e) = one {
         if list.is_empty() && cnt > 0 {
             list.extend(std::iter::repeat(e).take(cnt as usize));
@@ -160,11 +185,29 @@ fn eps_list(p: &Value) -> Vec<f64> {
 /// op='dp_compose' → JSON {n, delta, basic_total, advanced_total, saving_ratio}
 pub fn dp_compose(p: &Value) -> String {
     let delta = f_opt(p, "delta").unwrap_or(1e-5);
+    if f_opt(p, "count").map(|c| c as i64).unwrap_or(0) > MAX_QUERIES {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str(format!("count must be <= {}", MAX_QUERIES)),
+        )]));
+    }
+    if !delta_ok(delta) {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("delta must be in (0,1) for advanced composition (0 < δ < 1)".into()),
+        )]));
+    }
     let list = eps_list(p);
     if list.is_empty() {
         return json::encode(&json::obj(vec![(
             "error",
             Value::Str("epsilon or epsilons required".into()),
+        )]));
+    }
+    if !list.iter().all(|e| epsilon_ok(*e)) {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("epsilons must be finite and >= 0 and < 700".into()),
         )]));
     }
     let basic = list_sum(&list);
@@ -190,14 +233,29 @@ pub fn dp_alloc(p: &Value) -> String {
             Value::Str("n (query count) must be >= 1".into()),
         )]));
     }
+    if n > MAX_QUERIES {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str(format!("n must be <= {}", MAX_QUERIES)),
+        )]));
+    }
     let comp = p.get_s("composition").unwrap_or("basic").to_string();
     let delta = f_opt(p, "delta").unwrap_or(1e-5);
+    if !delta_ok(delta) {
+        return json::encode(&json::obj(vec![(
+            "error",
+            Value::Str("delta must be in (0,1) for advanced composition (0 < δ < 1)".into()),
+        )]));
+    }
     let basic_per = budget / n as f64;
 
     // advanced: binary search for the largest uniform ε whose strong
-    // composition bound stays ≤ budget (80 iterations, as in the Lua)
+    // composition bound stays ≤ budget (80 iterations, as in the Lua).
+    // e.exp() overflows above ~709; a tiny δ pushes the search ceiling there,
+    // so clamp hi to the exp-domain ceiling to keep the arithmetic finite.
+    let exp_cap = 700.0;
     let mut lo = 0.0;
-    let mut hi = budget;
+    let mut hi = budget.min(exp_cap);
     for _ in 0..80 {
         let mid = (lo + hi) / 2.0;
         let lst = vec![mid; n as usize];
@@ -271,6 +329,12 @@ pub fn dp_budget(p: &Value) -> String {
     let mut tot_before = before;
     let mut tot_after = after_basic;
     if comp == "advanced" {
+        if !delta_ok(delta) {
+            return json::encode(&json::obj(vec![(
+                "error",
+                Value::Str("delta must be in (0,1) for advanced composition (0 < δ < 1)".into()),
+            )]));
+        }
         tot_before = advanced_epsilon(&list, delta);
         let mut l2 = list.clone();
         l2.push(request);
@@ -376,6 +440,56 @@ mod tests {
         let out = dp_budget(&p);
         assert!(out.contains("\"allow\":false"));
         assert!(out.contains("budget_exceeded"));
+    }
+
+    /// Re-review P3-2: composition ops used to emit `inf`/`NaN` tokens (not
+    /// valid JSON) for out-of-domain input -- huge epsilon (e.exp() overflow),
+    /// delta 0 / negative / >= 1 (ln(1/delta) diverges / sqrt of a negative).
+    /// They must now return a structured error JSON instead.
+    #[test]
+    fn compose_rejects_out_of_domain() {
+        let huge = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(1000.0)),
+        ]));
+        assert!(huge.contains("\"error\""), "1000 gave {huge}");
+        let d0 = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(0.5)),
+            ("delta", json::Value::Num(0.0)),
+        ]));
+        assert!(d0.contains("\"error\""), "delta=0 gave {d0}");
+        let d1 = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(0.5)),
+            ("delta", json::Value::Num(5.0)),
+        ]));
+        assert!(d1.contains("\"error\""), "delta=5 gave {d1}");
+        let dneg = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(0.5)),
+            ("delta", json::Value::Num(-1.0)),
+        ]));
+        assert!(dneg.contains("\"error\""), "delta=-1 gave {dneg}");
+        let ok = dp_compose(&json::obj(vec![
+            ("epsilon", json::Value::Num(0.5)),
+        ]));
+        assert!(!ok.contains("\"error\""), "valid got {ok}");
+        assert!(!ok.contains("inf") && !ok.contains("NaN"), "NaN/inf leaked: {ok}");
+    }
+
+    /// dp_alloc / dp_budget use the same bound; a bad delta must error, not NaN.
+    #[test]
+    fn alloc_budget_reject_bad_delta() {
+        let a = dp_alloc(&json::obj(vec![
+            ("budget", json::Value::Num(1.0)),
+            ("n", json::Value::Num(5.0)),
+            ("delta", json::Value::Num(0.0)),
+        ]));
+        assert!(a.contains("\"error\""), "alloc delta=0 gave {a}");
+        let b = dp_budget(&json::obj(vec![
+            ("budget", json::Value::Num(1.0)),
+            ("request", json::Value::Num(0.2)),
+            ("composition", json::Value::Str("advanced".into())),
+            ("delta", json::Value::Num(5.0)),
+        ]));
+        assert!(b.contains("\"error\""), "budget delta=5 gave {b}");
     }
 
 }
